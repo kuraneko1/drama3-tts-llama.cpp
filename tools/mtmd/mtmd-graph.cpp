@@ -1119,14 +1119,20 @@ std::unique_ptr<mtmd_graph> mtmd_get_graph_builder(mtmd_subcontext * ctx, const 
             {
                 const auto gen_process = params ? params->gen_process : MTMD_SUBCTX_GEN_PROCESS_GEN_CODE;
                 const int64_t n_cb = ctx->model.gen_code_embd_w->ne[2];
-                const int n_frames = params && params->codes ? (int) (params->codes->size() / n_cb) : 1;
                 const int   top_k = params ? params->top_k : 30;
                 const float top_p = params ? params->top_p : 0.9f;
                 const float temp  = params ? params->temp  : 1.0f;
                 if (ctx->model.proj_type == PROJECTOR_TYPE_FISH_S2_GEN) {
+                    const int n_frames = params && params->codes ? (int) (params->codes->size() / n_cb) : 1;
                     builder = std::make_unique<mtmd_graph_fish_s2_gen>(ctx, img, gen_process, params ? params->gen_state : nullptr, n_frames, top_k, top_p, temp);
-                } else {
+                } else if (gen_process == MTMD_SUBCTX_GEN_PROCESS_GEN_WAV) {
+                    const int n_frames = params && params->codes ? (int) (params->codes->size() / n_cb) : 1;
                     builder = std::make_unique<mtmd_graph_drama3_gen>(ctx, img, gen_process, params ? params->gen_state : nullptr, n_frames, top_k, top_p, temp);
+                } else {
+                    const int  n_rows   = std::max(1, img.ny());
+                    const bool forced   = params ? (params->codes && params->codes->size() == (size_t) (2 * n_cb * n_rows)) : (n_rows > 1);
+                    const bool emit_out = params ? (params->out_embd != nullptr) : (n_rows == 1);
+                    builder = std::make_unique<mtmd_graph_drama3_gen>(ctx, img, gen_process, params ? params->gen_state : nullptr, forced ? 2 : 1, top_k, top_p, temp, emit_out);
                 }
             } break;
         case PROJECTOR_TYPE_QWEN3TTS_GEN:

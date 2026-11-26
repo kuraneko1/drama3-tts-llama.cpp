@@ -4370,11 +4370,21 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, mtmd_gen_state * 
 
     if (inp->type == MTMD_GEN_PROCESS_TYPE_GEN_CODE) {
         const size_t n_embd = (size_t) sctx->model.n_mmproj_embd();
+        const bool drama3_batch = sctx->model.proj_type == PROJECTOR_TYPE_DRAMA3_GEN && inp->feats && inp->n_feats > 0;
+        const size_t n_rows = drama3_batch ? (inp->n_feats / n_embd) : 1;
+        if (n_rows == 0 || (drama3_batch && inp->n_feats != n_rows * n_embd)) {
+            LOG_ERR("%s: invalid feats size %zu for drama3 batch\n", __func__, inp->n_feats);
+            return 1;
+        }
 
         // the hidden state may be omitted when the graph does not use it
         mtmd_image_f32 hidden_state;
-        hidden_state.set_size({(int) n_embd, 1}, false, true);
-        hidden_state.cpy_buf(inp->embd ? std::vector<float>(inp->embd, inp->embd + n_embd) : std::vector<float>(n_embd, 0.0f));
+        hidden_state.set_size({(int) n_embd, (int) n_rows}, false, true);
+        if (drama3_batch) {
+            hidden_state.cpy_buf(std::vector<float>(inp->feats, inp->feats + inp->n_feats));
+        } else {
+            hidden_state.cpy_buf(inp->embd ? std::vector<float>(inp->embd, inp->embd + n_embd) : std::vector<float>(n_embd, 0.0f));
+        }
 
         std::vector<int32_t> in_codes;
         if (inp->codes) {
@@ -4385,7 +4395,7 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, mtmd_gen_state * 
         batch.is_audio = true;
         batch.entries.push_back(std::move(hidden_state));
 
-        std::vector<float>   out_embd(n_embd);
+        std::vector<float>   out_embd(drama3_batch ? 0 : n_embd);
         std::vector<int32_t> out_codes;
         std::vector<float>   out_feats;
         bool is_eos = false;
@@ -4394,9 +4404,9 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, mtmd_gen_state * 
         params.imgs          = &batch;
         params.n_threads     = ctx->n_threads;
         params.gen_process   = MTMD_SUBCTX_GEN_PROCESS_GEN_CODE;
-        params.out_embd      = &out_embd;
-        params.out_codes     = &out_codes;
-        params.out_feats     = &out_feats;
+        params.out_embd      = drama3_batch ? nullptr : &out_embd;
+        params.out_codes     = drama3_batch ? nullptr : &out_codes;
+        params.out_feats     = drama3_batch ? nullptr : &out_feats;
         params.code0         = inp->code0;
         params.top_k         = inp->top_k;
         params.top_p         = inp->top_p;
@@ -4414,10 +4424,10 @@ static int32_t mtmd_gen_audio_process_impl(mtmd_context * ctx, mtmd_gen_state * 
         state->out_codes = std::move(out_codes);
         state->out_feats = std::move(out_feats);
 
-        out->embd      = state->out_embd.data();
-        out->codes     = state->out_codes.data();
+        out->embd      = state->out_embd.empty() ? nullptr : state->out_embd.data();
+        out->codes     = state->out_codes.empty() ? nullptr : state->out_codes.data();
         out->n_codes   = state->out_codes.size();
-        out->feats     = state->out_feats.data();
+        out->feats     = state->out_feats.empty() ? nullptr : state->out_feats.data();
         out->n_feats   = state->out_feats.size();
         out->is_eos    = is_eos;
         return 0;

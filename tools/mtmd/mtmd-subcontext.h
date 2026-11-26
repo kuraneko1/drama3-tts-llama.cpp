@@ -106,9 +106,11 @@ struct mtmd_subctx_gen_state {
     ggml_context_ptr        ctx_data;
     ggml_backend_buffer_ptr buf;
     std::vector<ggml_tensor *> slots; // same order as list_gen_state_slots(), F32 [ne0, ne1]
+    int32_t tower_pos = 0;
 
     // clears the slots and keeps the RNG stream
     void reset() {
+        tower_pos = 0;
         if (buf) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
@@ -229,6 +231,18 @@ private:
 
     // kokoro GEN_WAV: codes are the phoneme tokens, feats the voice row followed by the backbone state of each token
     bool encode_kokoro(mtmd_subctx_encode_params * params);
+
+    struct drama3_tower_cache {
+        bool                  sched_holds = false;
+        int                   n_kv_ctx    = 0;
+        bool                  forced      = false;
+        bool                  emit_out    = true;
+        ggml_backend_buffer_t state_buf   = nullptr;
+        std::vector<uint8_t>  compute_meta;
+        ggml_context_ptr      ctx;
+        ggml_cgraph *         gf         = nullptr;
+        ggml_tensor *         embeddings = nullptr;
+    } drama3_cache;
 
     // only initialize backend buffers, but do not allocate them yet
     support_info_graph reserve_compute_meta(const mtmd_image_f32_batch & batch);

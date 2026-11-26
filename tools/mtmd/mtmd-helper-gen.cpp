@@ -2753,6 +2753,8 @@ public:
         wav_header_sent = false;
         audio_pcm.clear();
         h_state_buf.clear();
+        prompt_h_buf.clear();
+        prompt_rows_codes.clear();
         out_buf.clear();
     }
 
@@ -2842,12 +2844,14 @@ public:
                 save_main_logits(i);
                 break;
             }
-            if (!run_prompt_tower(row, h)) {
-                return -1;
-            }
+            prompt_h_buf.insert(prompt_h_buf.end(), h, h + n_embd);
+            append_prompt_tower_codes(row);
         }
         pos        += n;
         prompt_pos += n;
+        if (prompt_pos == n_prompt && !prompt_h_buf.empty() && !run_prompt_tower_batch()) {
+            return -1;
+        }
         return n_prompt - prompt_pos;
     }
 
@@ -3048,22 +3052,35 @@ protected:
 
     // tower row of a prompt row: the input frame is the codes of this row (reference frame) or none,
     // the codes of the next row are forced when it is a reference frame
-    bool run_prompt_tower(int row, const float * h) {
+    void append_prompt_tower_codes(int row) {
         const bool cur  = is_speech_row(row);
         const bool next = is_speech_row(row + 1);
         const auto ref_frame = [&](int r) { return ref_codes.begin() + (size_t) (r - ref_begin) * n_cb; };
-        if (next) {
-            // [input frame, -1 for a text row | forced next frame]
-            frame.assign(n_cb, -1);
-            if (cur) {
-                std::copy(ref_frame(row), ref_frame(row + 1), frame.begin());
-            }
-            frame.insert(frame.end(), ref_frame(row + 1), ref_frame(row + 2));
-        } else if (cur) {
-            frame.assign(ref_frame(row), ref_frame(row + 1));
+        const size_t off = prompt_rows_codes.size();
+        prompt_rows_codes.resize(off + 2 * n_cb, -1);
+        if (cur) {
+            std::copy(ref_frame(row), ref_frame(row + 1), prompt_rows_codes.begin() + off);
         }
-        const bool ok = run_tower(next ? frame[n_cb] : -1, h) != nullptr;
-        frame.clear();
+        if (next) {
+            std::copy(ref_frame(row + 1), ref_frame(row + 2), prompt_rows_codes.begin() + off + n_cb);
+        }
+    }
+
+    bool run_prompt_tower_batch() {
+        mtmd_gen_inp inp = mtmd_gen_inp_default(mctx);
+        inp.type    = MTMD_GEN_PROCESS_TYPE_GEN_CODE;
+        inp.code0   = -1;
+        inp.feats   = prompt_h_buf.data();
+        inp.n_feats = prompt_h_buf.size();
+        inp.codes   = prompt_rows_codes.data();
+        inp.n_codes = prompt_rows_codes.size();
+        mtmd_gen_out out{};
+        const bool ok = mtmd_gen_audio_process(mctx, gen_state.get(), &inp, &out) == 0;
+        prompt_h_buf.clear();
+        prompt_rows_codes.clear();
+        if (!ok) {
+            LOG_ERR("mtmd_helper_gen_audio: batched codebook tower failed\n");
+        }
         return ok;
     }
 
@@ -3202,6 +3219,8 @@ protected:
 
     std::vector<float>   audio_pcm;
     std::vector<float>   h_state_buf;
+    std::vector<float>   prompt_h_buf;
+    std::vector<int32_t> prompt_rows_codes;
     mtmd_helper_gen_audio_outtype out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
     std::vector<char> out_buf;
     bool   stream          = false;

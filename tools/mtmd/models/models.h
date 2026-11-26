@@ -680,12 +680,19 @@ std::vector<c2w_state_slot> list_moshi_state_slots(const mtmd_hparams & hparams,
 //
 struct mtmd_graph_drama3_gen : mtmd_graph {
     mtmd_graph_drama3_gen(mtmd_subcontext * ctx, const mtmd_image_f32 & img, mtmd_subctx_gen_process gen_process, mtmd_subctx_gen_state * gen_state,
-                          int n_frames, int top_k, float top_p, float temp)
-        : mtmd_graph(ctx, img), gen_process(gen_process), gen_state(gen_state), n_frames(n_frames), top_k(top_k), top_p(top_p), temp(temp) {}
+                          int n_frames, int top_k, float top_p, float temp, bool emit_out = true)
+        : mtmd_graph(ctx, img), gen_process(gen_process), gen_state(gen_state), n_frames(n_frames), top_k(top_k), top_p(top_p), temp(temp), emit_out(emit_out) {}
     ggml_cgraph * build() override;
 
     // tower KV rows, shared by the prompt and the generated frames
     static constexpr int n_pos_max = 4096;
+    static int kv_bucket(int pos_end) {
+        int b = 256;
+        while (b < pos_end && b < n_pos_max) {
+            b *= 2;
+        }
+        return std::min(b, n_pos_max);
+    }
 
     mtmd_subctx_gen_process gen_process;
     mtmd_subctx_gen_state * gen_state; // nullptr on buffer reserve
@@ -693,11 +700,13 @@ struct mtmd_graph_drama3_gen : mtmd_graph {
     int   top_k;
     float top_p;
     float temp;
+    bool  emit_out;
 
     ggml_cgraph * build_tower();
     ggml_cgraph * build_codec();
     ggml_tensor * tower_layer(ggml_tensor * x, int il, ggml_tensor * code, ggml_tensor * mask, ggml_tensor * extra,
-                              ggml_tensor * inp_pos, ggml_tensor * k_slot, ggml_tensor * v_slot, int pos);
+                              ggml_tensor * inp_pos, ggml_tensor * kq_mask, ggml_tensor * k_slot, ggml_tensor * v_slot,
+                              int n_rows, int n_kv_ctx);
 };
 
 //

@@ -23,7 +23,8 @@ std::vector<c2w_state_slot> list_drama3_state_slots(const mtmd_hparams & hparams
 
 // h_out = out_norm(Block(eh_proj([enorm(mask * E[code] + extra); hnorm(h_in)])))
 ggml_tensor * mtmd_graph_drama3_gen::tower_layer(ggml_tensor * x, int il, ggml_tensor * code, ggml_tensor * mask, ggml_tensor * extra,
-                                                 ggml_tensor * inp_pos, ggml_tensor * k_slot, ggml_tensor * v_slot, int pos) {
+                                                 ggml_tensor * inp_pos, ggml_tensor * kq_mask, ggml_tensor * k_slot, ggml_tensor * v_slot,
+                                                 int n_rows, int n_kv_ctx) {
     const auto & layer = model.layers[il];
     const auto & tl    = model.drama3_layers[il];
     const int     n_head    = hparams.n_head;
@@ -41,8 +42,8 @@ ggml_tensor * mtmd_graph_drama3_gen::tower_layer(ggml_tensor * x, int il, ggml_t
     ggml_tensor * mixed = ggml_mul_mat(ctx0, tl.eh_proj_w, ggml_concat(ctx0, e, h, 0));
 
     ggml_tensor * cur = ggml_mul(ctx0, ggml_rms_norm(ctx0, mixed, eps), layer.ln_1_w);
-    ggml_tensor * q    = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, layer.q_w, cur), d_head, n_head, 1);
-    ggml_tensor * k    = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, layer.k_w, cur), d_head, n_head_kv, 1);
+    ggml_tensor * q    = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, layer.q_w, cur), d_head, n_head, n_rows);
+    ggml_tensor * k    = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, layer.k_w, cur), d_head, n_head_kv, n_rows);
     ggml_tensor * v    = ggml_mul_mat(ctx0, layer.v_w, cur);
     ggml_tensor * gate = ggml_mul_mat(ctx0, layer.attn_gate_w, cur);
 
@@ -51,22 +52,18 @@ ggml_tensor * mtmd_graph_drama3_gen::tower_layer(ggml_tensor * x, int il, ggml_t
     q = ggml_rope_ext(ctx0, q, inp_pos, nullptr, DRAMA3_N_ROT, GGML_ROPE_TYPE_NORMAL, 0, DRAMA3_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     k = ggml_rope_ext(ctx0, k, inp_pos, nullptr, DRAMA3_N_ROT, GGML_ROPE_TYPE_NORMAL, 0, DRAMA3_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-    // write K/V of this row to the slot, attention uses the cached rows + this row
-    ggml_tensor * k_new = ggml_reshape_2d(ctx0, k, n_kv, 1);
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, k_new, ggml_view_2d(ctx0, k_slot, n_kv, 1, k_slot->nb[1], (size_t) pos * k_slot->nb[1])));
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, v,     ggml_view_2d(ctx0, v_slot, n_kv, 1, v_slot->nb[1], (size_t) pos * v_slot->nb[1])));
-    ggml_tensor * k_all = k_new;
-    ggml_tensor * v_all = v;
-    if (pos > 0) {
-        k_all = ggml_concat(ctx0, ggml_view_2d(ctx0, k_slot, n_kv, pos, k_slot->nb[1], 0), k_new, 1);
-        v_all = ggml_concat(ctx0, ggml_view_2d(ctx0, v_slot, n_kv, pos, v_slot->nb[1], 0), v,     1);
-    }
+    // scatter new K/V rows into persistent slot buffers, then attend over bucketed prefix [0, n_kv_ctx) with causal mask
+    ggml_tensor * k_new = ggml_reshape_2d(ctx0, k, n_kv, n_rows);
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_slot, k_new, inp_pos));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v_slot, v,     inp_pos));
+    ggml_tensor * k_all = ggml_view_2d(ctx0, k_slot, n_kv, n_kv_ctx, k_slot->nb[1], 0);
+    ggml_tensor * v_all = ggml_view_2d(ctx0, v_slot, n_kv, n_kv_ctx, v_slot->nb[1], 0);
 
     ggml_tensor * attn = build_attn(nullptr, nullptr,
-                                    ggml_reshape_4d(ctx0, q,     d_head, n_head,    1,       1),
-                                    ggml_reshape_4d(ctx0, k_all, d_head, n_head_kv, pos + 1, 1),
-                                    ggml_reshape_4d(ctx0, v_all, d_head, n_head_kv, pos + 1, 1),
-                                    nullptr, 1.0f / sqrtf((float) d_head), il);
+                                    ggml_reshape_4d(ctx0, q,     d_head, n_head,    n_rows,   1),
+                                    ggml_reshape_4d(ctx0, k_all, d_head, n_head_kv, n_kv_ctx, 1),
+                                    ggml_reshape_4d(ctx0, v_all, d_head, n_head_kv, n_kv_ctx, 1),
+                                    kq_mask, 1.0f / sqrtf((float) d_head), il);
     attn = ggml_mul(ctx0, attn, ggml_sigmoid(ctx0, gate));
     cur = ggml_add(ctx0, mixed, ggml_mul_mat(ctx0, layer.o_w, attn));
 
@@ -79,21 +76,25 @@ ggml_tensor * mtmd_graph_drama3_gen::tower_layer(ggml_tensor * x, int il, ggml_t
     return cur;
 }
 
-// one row: backbone hidden + next main code -> other codes of that frame + next backbone input
+// 1+ rows: backbone hidden + next main code -> other codes of that frame + next backbone input (single row) or KV fill (batched prompt)
 ggml_cgraph * mtmd_graph_drama3_gen::build_tower() {
     const int     n_layer   = (int) model.layers.size();
     const int     n_heads   = (int) model.gen_code_head_w->ne[2]; // one per residual codebook
     const int     n_shared  = n_layer - n_heads;
     const int64_t n_cb      = model.gen_code_embd_w->ne[2];
     const int64_t n_embd_cb = model.gen_code_embd_w->ne[0];
+    const int     n_rows    = std::max(1, img.ny());
+    const bool    forced    = n_frames == 2;
+    GGML_ASSERT(forced || n_rows == 1);
+    GGML_ASSERT(!emit_out || n_rows == 1);
 
-    int pos = 0;
+    const int pos = gen_state ? gen_state->tower_pos : 0;
+    const int n_kv_ctx = gen_state ? kv_bucket(pos + n_rows) : n_pos_max;
+    GGML_ASSERT(pos + n_rows <= n_pos_max);
+
     std::vector<ggml_tensor *> slots;
     const auto slot_list = list_drama3_state_slots(hparams, model);
     if (gen_state) {
-        float pos_f = 0.0f;
-        ggml_backend_tensor_get(gen_state->slots[0], &pos_f, 0, sizeof(float));
-        pos = (int) pos_f;
         slots = gen_state->slots;
     } else {
         // buffer reserve: no gen state, use stand-in slots
@@ -106,36 +107,36 @@ ggml_cgraph * mtmd_graph_drama3_gen::build_tower() {
             slots.push_back(t);
         }
     }
-    GGML_ASSERT(pos < n_pos_max);
 
-    ggml_tensor * h = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_mmproj_embd);
+    ggml_tensor * h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_mmproj_embd, n_rows);
     ggml_set_name(h, "inp_raw");
     ggml_set_input(h);
 
-    ggml_tensor * inp_code0 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_tensor * inp_code0 = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
     ggml_set_name(inp_code0, "inp_code0");
     ggml_set_input(inp_code0);
 
-    // codes 2.. of the input frame, as row ids of the merged codebook table
-    ggml_tensor * inp_extra = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cb - 2);
+    // codes 2.. of each input frame, as row ids of the merged codebook table: [n_cb - 2, n_rows]
+    ggml_tensor * inp_extra = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_cb - 2, n_rows);
     ggml_set_name(inp_extra, "inp_extra");
     ggml_set_input(inp_extra);
 
-    // [next frame is speech, input frame is speech]
-    ggml_tensor * inp_scale = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 2);
+    // [n_rows, 2]: row 0 = next frame is speech, row 1 = input frame is speech
+    ggml_tensor * inp_scale = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_rows, 2);
     ggml_set_name(inp_scale, "inp_scale");
     ggml_set_input(inp_scale);
 
-    ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
     ggml_set_name(inp_pos, "inp_pos");
     ggml_set_input(inp_pos);
 
-    // teacher forcing (reference rows of a voice clone): codes 1.. of the frame are given, nothing is sampled
-    const bool forced = n_frames == 2;
+    ggml_tensor * kq_mask = build_inp_attn_mask(n_kv_ctx, n_rows, 0);
+
+    // teacher forcing (prompt rows): codes 1.. of the frame are given, nothing is sampled
     ggml_tensor * inp_rand  = nullptr;
     ggml_tensor * inp_force = nullptr;
     if (forced) {
-        inp_force = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads);
+        inp_force = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_rows, n_heads);
         ggml_set_name(inp_force, "inp_force");
         ggml_set_input(inp_force);
     } else {
@@ -144,27 +145,30 @@ ggml_cgraph * mtmd_graph_drama3_gen::build_tower() {
         ggml_set_input(inp_rand);
     }
 
-    ggml_tensor * mask     = ggml_view_1d(ctx0, inp_scale, 1, 0);
-    ggml_tensor * extra_on = ggml_view_1d(ctx0, inp_scale, 1, sizeof(float));
+    ggml_tensor * mask     = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, inp_scale, n_rows, 0), 1, n_rows);
+    ggml_tensor * extra_on = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, inp_scale, n_rows, (size_t) n_rows * sizeof(float)), 1, n_rows);
 
     ggml_tensor * cb_all = ggml_reshape_2d(ctx0, model.gen_code_embd_w, n_embd_cb, model.gen_code_embd_w->ne[1] * n_cb);
-    ggml_tensor * extra  = ggml_cont(ctx0, ggml_transpose(ctx0, ggml_get_rows(ctx0, cb_all, inp_extra)));
-    extra = ggml_mul(ctx0, ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, extra), n_embd_cb, 1), extra_on);
+    ggml_tensor * extra  = ggml_get_rows(ctx0, cb_all, ggml_reshape_1d(ctx0, inp_extra, (n_cb - 2) * n_rows));
+    extra = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, extra, n_embd_cb, n_cb - 2, n_rows), 1, 0, 2, 3));
+    extra = ggml_mul(ctx0, ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, extra), n_embd_cb, n_rows), extra_on);
 
     mtmd_graph_qwen3tts_gen::code_gen cg(*this, top_k, top_p);
-    ggml_tensor * out_codes = cg.cache_set(ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_cb), 0, inp_code0);
+    ggml_tensor * out_codes = emit_out ? cg.cache_set(ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_cb), 0, inp_code0) : nullptr;
 
     ggml_tensor * code = inp_code0;
-    ggml_tensor * x    = ggml_reshape_2d(ctx0, h, n_mmproj_embd, 1);
+    ggml_tensor * x    = h;
     for (int il = 0; il < n_layer; il++) {
-        x = tower_layer(x, il, code, mask, il == 0 ? extra : nullptr, inp_pos, slots[1 + 2 * il], slots[2 + 2 * il], pos);
+        x = tower_layer(x, il, code, mask, il == 0 ? extra : nullptr, inp_pos, kq_mask, slots[1 + 2 * il], slots[2 + 2 * il], n_rows, n_kv_ctx);
         if (il < n_shared) {
             continue;
         }
         const int ih = il - n_shared;
         if (forced) {
-            code = ggml_view_1d(ctx0, inp_force, 1, (size_t) ih * sizeof(int32_t));
-            out_codes = cg.cache_set(out_codes, ih + 1, code);
+            code = ggml_view_1d(ctx0, inp_force, n_rows, (size_t) ih * inp_force->nb[1]);
+            if (emit_out) {
+                out_codes = cg.cache_set(out_codes, ih + 1, code);
+            }
             continue;
         }
         ggml_tensor * head   = ggml_view_2d(ctx0, model.gen_code_head_w, model.gen_code_head_w->ne[0], model.gen_code_head_w->ne[1],
@@ -174,11 +178,15 @@ ggml_cgraph * mtmd_graph_drama3_gen::build_tower() {
             logits = ggml_scale(ctx0, logits, 1.0f / temp);
         }
         code = cg.do_sampling(logits, ggml_view_1d(ctx0, inp_rand, 1, (size_t) ih * sizeof(float)));
-        out_codes = cg.cache_set(out_codes, ih + 1, code);
+        if (emit_out) {
+            out_codes = cg.cache_set(out_codes, ih + 1, code);
+        }
     }
 
-    ggml_tensor * pos_slot = slots[0];
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_scale_bias(ctx0, pos_slot, 1.0f, 1.0f), pos_slot));
+    if (!emit_out) {
+        ggml_build_forward_expand(gf, x);
+        return gf;
+    }
 
     out_codes = ggml_cont(ctx0, out_codes);
     ggml_set_name(out_codes, "out_codes");

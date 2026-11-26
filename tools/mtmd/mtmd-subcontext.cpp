@@ -632,26 +632,82 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         LOG_ERR("%s: audio gen requires a gen state\n", __func__);
         return false;
     }
-    if (model.proj_type == PROJECTOR_TYPE_DRAMA3_GEN && params->gen_process == MTMD_SUBCTX_GEN_PROCESS_GEN_CODE) {
-        float pos = 0.0f;
-        ggml_backend_tensor_get(params->gen_state->slots[0], &pos, 0, sizeof(float));
-        if ((int) pos >= mtmd_graph_drama3_gen::n_pos_max) {
-            LOG_ERR("%s: the codebook tower holds at most %d rows\n", __func__, mtmd_graph_drama3_gen::n_pos_max);
-            return false;
-        }
+    const bool is_drama3_tower = model.proj_type == PROJECTOR_TYPE_DRAMA3_GEN && params->gen_process == MTMD_SUBCTX_GEN_PROCESS_GEN_CODE;
+    const int  drama3_n_rows   = is_drama3_tower ? std::max(1, imgs.entries[0].ny()) : 1;
+    if (is_drama3_tower && params->gen_state->tower_pos + drama3_n_rows > mtmd_graph_drama3_gen::n_pos_max) {
+        LOG_ERR("%s: the codebook tower holds at most %d rows (pos=%d, n_rows=%d)\n",
+                __func__, mtmd_graph_drama3_gen::n_pos_max, params->gen_state->tower_pos, drama3_n_rows);
+        return false;
     }
 
-    // build the inference graph
-    ggml_backend_sched_reset(backends.sched.get());
-    ggml_cgraph * gf = mtmd_get_graph_builder(this, imgs, params)->build();
+    ggml_cgraph * gf         = nullptr;
+    ggml_tensor * embeddings = nullptr;
+    const int64_t drama3_n_cb = is_drama3_tower ? model.gen_code_embd_w->ne[2] : 0;
+    const bool    can_cache_drama3 = is_drama3_tower && drama3_n_rows == 1;
+    if (can_cache_drama3) {
+        const int  n_kv_ctx = mtmd_graph_drama3_gen::kv_bucket(params->gen_state->tower_pos + 1);
+        const bool forced   = params->codes && params->codes->size() == (size_t) (2 * drama3_n_cb);
+        const bool emit_out = params->out_embd != nullptr;
+        const bool hit = drama3_cache.gf != nullptr &&
+                         drama3_cache.n_kv_ctx  == n_kv_ctx &&
+                         drama3_cache.forced    == forced &&
+                         drama3_cache.emit_out  == emit_out &&
+                         drama3_cache.state_buf == params->gen_state->buf.get();
+        if (hit) {
+            gf         = drama3_cache.gf;
+            embeddings = drama3_cache.embeddings;
+            if (!drama3_cache.sched_holds) {
+                ggml_backend_sched_reset(backends.sched.get());
+                if (!ggml_backend_sched_alloc_graph(backends.sched.get(), gf)) {
+                    LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+                    return false;
+                }
+                drama3_cache.sched_holds = true;
+            }
+        } else {
+            drama3_cache.sched_holds = false;
+            drama3_cache.gf         = nullptr;
+            drama3_cache.embeddings = nullptr;
+            drama3_cache.ctx.reset();
+            drama3_cache.compute_meta.resize(buf_compute_meta.size());
 
-    // the last node is the embedding tensor, code2wav has no out_embd
-    // read it before scheduling: backends may reorder the nodes of graphs with several outputs (Metal)
-    ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+            ggml_backend_sched_reset(backends.sched.get());
+            std::swap(buf_compute_meta, drama3_cache.compute_meta);
+            {
+                auto builder = mtmd_get_graph_builder(this, imgs, params);
+                gf         = builder->build();
+                embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+                drama3_cache.ctx = std::move(builder->ctx0_ptr);
+            }
+            std::swap(buf_compute_meta, drama3_cache.compute_meta);
 
-    if (!ggml_backend_sched_alloc_graph(backends.sched.get(), gf)) {
-        LOG_ERR("%s: failed to allocate compute graph\n", __func__);
-        return false;
+            drama3_cache.gf         = gf;
+            drama3_cache.embeddings = embeddings;
+            drama3_cache.n_kv_ctx   = n_kv_ctx;
+            drama3_cache.forced     = forced;
+            drama3_cache.emit_out   = emit_out;
+            drama3_cache.state_buf  = params->gen_state->buf.get();
+
+            if (!ggml_backend_sched_alloc_graph(backends.sched.get(), gf)) {
+                drama3_cache.gf = nullptr;
+                drama3_cache.embeddings = nullptr;
+                drama3_cache.ctx.reset();
+                LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+                return false;
+            }
+            drama3_cache.sched_holds = true;
+        }
+    } else {
+        drama3_cache.sched_holds = false;
+        ggml_backend_sched_reset(backends.sched.get());
+        gf = mtmd_get_graph_builder(this, imgs, params)->build();
+        // the last node is the embedding tensor, code2wav has no out_embd
+        // read it before scheduling: backends may reorder the nodes of graphs with several outputs (Metal)
+        embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+        if (!ggml_backend_sched_alloc_graph(backends.sched.get(), gf)) {
+            LOG_ERR("%s: failed to allocate compute graph\n", __func__);
+            return false;
+        }
     }
 
     // set inputs
@@ -2009,43 +2065,75 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                     std::vector<int32_t> code0 = { params->code0 };
                     set_input_i32("inp_code0", code0);
                 } else {
-                    // code0 < 0: next row is text (prompt), the tower only fills its KV
-                    // codes: input frame codes for a speech row, empty for a text row
-                    //        then optionally the codes of the next frame (reference rows): teacher forcing, code0 must be its code 0
-                    const bool next_speech = params->code0 >= 0;
-                    const size_t n_given   = params->codes ? params->codes->size() : 0;
-                    const bool forced      = n_given == (size_t) (2 * n_cb);
-                    if (params->code0 >= n_vocab || (n_given != 0 && n_given != (size_t) n_cb && !forced) ||
-                            (forced && params->code0 != (*params->codes)[n_cb])) {
-                        LOG_ERR("%s: invalid tower input (code0 %d, %zu codes)\n", __func__, params->code0, n_given);
+                    const int n_rows     = std::max(1, imgs.entries[0].ny());
+                    const int n_heads    = (int) model.gen_code_head_w->ne[2];
+                    const size_t n_given = params->codes ? params->codes->size() : 0;
+                    const bool forced    = n_given == (size_t) (2 * n_cb * n_rows);
+                    if (!forced && (n_rows != 1 || params->code0 >= n_vocab || (n_given != 0 && n_given != (size_t) n_cb))) {
+                        LOG_ERR("%s: invalid tower input (n_rows %d, code0 %d, %zu codes)\n", __func__, n_rows, params->code0, n_given);
                         return false;
                     }
-                    const bool cur_speech  = n_given != 0 && (*params->codes)[0] >= 0;
-                    std::vector<int32_t> code0 = { std::max(params->code0, 0) };
-                    set_input_i32("inp_code0", code0);
-
-                    std::vector<int32_t> extra(n_cb - 2);
-                    for (int64_t g = 2; g < n_cb; g++) {
-                        const int32_t c = cur_speech ? std::clamp<int32_t>((*params->codes)[g], 0, (int32_t) n_vocab - 1) : 0;
-                        extra[g - 2] = c + (int32_t) (g * n_vocab);
+                    if (forced && n_rows == 1 && params->code0 >= 0 && params->code0 != (*params->codes)[n_cb]) {
+                        LOG_ERR("%s: invalid forced tower input (code0 %d != %d)\n", __func__, params->code0, (*params->codes)[n_cb]);
+                        return false;
                     }
-                    set_input_i32("inp_extra", extra);
-                    set_input_f32("inp_scale", { next_speech ? 1.0f : 0.0f, cur_speech ? 1.0f : 0.0f });
 
-                    float pos = 0.0f;
-                    ggml_backend_tensor_get(params->gen_state->slots[0], &pos, 0, sizeof(float));
-                    std::vector<int32_t> inp_pos = { (int32_t) pos };
+                    const int pos      = params->gen_state->tower_pos;
+                    const int n_kv_ctx = mtmd_graph_drama3_gen::kv_bucket(pos + n_rows);
+
+                    std::vector<int32_t> code0((size_t) n_rows);
+                    std::vector<int32_t> extra((size_t) n_rows * (size_t) (n_cb - 2));
+                    std::vector<float>   scale((size_t) n_rows * 2);
+                    std::vector<int32_t> inp_pos((size_t) n_rows);
+                    std::vector<int32_t> force(forced ? (size_t) n_rows * (size_t) n_heads : 0);
+
+                    for (int r = 0; r < n_rows; r++) {
+                        bool next_speech = false;
+                        bool cur_speech  = false;
+                        const int32_t * cur_f  = nullptr;
+                        const int32_t * next_f = nullptr;
+                        if (forced) {
+                            const int32_t * row_codes = params->codes->data() + (size_t) r * 2 * (size_t) n_cb;
+                            cur_f       = row_codes;
+                            next_f      = row_codes + n_cb;
+                            cur_speech  = cur_f[0] >= 0;
+                            next_speech = next_f[0] >= 0;
+                            code0[(size_t) r] = next_speech ? std::clamp<int32_t>(next_f[0], 0, (int32_t) n_vocab - 1) : 0;
+                            for (int ih = 0; ih < n_heads; ih++) {
+                                force[(size_t) ih * (size_t) n_rows + (size_t) r] =
+                                    next_speech ? std::clamp<int32_t>(next_f[1 + ih], 0, (int32_t) n_vocab - 1) : 0;
+                            }
+                        } else {
+                            cur_speech  = n_given != 0 && (*params->codes)[0] >= 0;
+                            next_speech = params->code0 >= 0;
+                            cur_f       = cur_speech ? params->codes->data() : nullptr;
+                            code0[0]    = std::max(params->code0, 0);
+                        }
+                        for (int64_t g = 2; g < n_cb; g++) {
+                            const int32_t c = cur_speech ? std::clamp<int32_t>(cur_f[g], 0, (int32_t) n_vocab - 1) : 0;
+                            extra[(size_t) r * (size_t) (n_cb - 2) + (size_t) (g - 2)] = c + (int32_t) (g * n_vocab);
+                        }
+                        scale[(size_t) r]                  = next_speech ? 1.0f : 0.0f;
+                        scale[(size_t) n_rows + (size_t) r] = cur_speech  ? 1.0f : 0.0f;
+                        inp_pos[(size_t) r]                = pos + r;
+                    }
+
+                    set_input_i32("inp_code0", code0);
+                    set_input_i32("inp_extra", extra);
+                    set_input_f32("inp_scale", scale);
                     set_input_i32("inp_pos", inp_pos);
 
+                    std::vector<float> attn_mask((size_t) n_kv_ctx * (size_t) n_rows, -INFINITY);
+                    for (int q = 0; q < n_rows; q++) {
+                        std::fill_n(attn_mask.data() + (size_t) q * (size_t) n_kv_ctx, pos + q + 1, 0.0f);
+                    }
+                    set_input_attn_mask(attn_mask);
+
                     if (forced) {
-                        std::vector<int32_t> force(model.gen_code_head_w->ne[2]);
-                        for (size_t ih = 0; ih < force.size(); ih++) {
-                            force[ih] = std::clamp<int32_t>((*params->codes)[n_cb + 1 + ih], 0, (int32_t) n_vocab - 1);
-                        }
                         set_input_i32("inp_force", force);
                     } else {
                         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-                        std::vector<float> r(model.gen_code_head_w->ne[2]);
+                        std::vector<float> r(n_heads);
                         for (auto & v : r) {
                             v = dist(params->gen_state->rng);
                         }
@@ -2617,6 +2705,9 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
+    }
+    if (is_drama3_tower && params->gen_state) {
+        params->gen_state->tower_pos += drama3_n_rows;
     }
 
     if (model.proj_type == PROJECTOR_TYPE_KOKORO) {
