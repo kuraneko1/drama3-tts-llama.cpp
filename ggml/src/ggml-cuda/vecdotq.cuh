@@ -541,16 +541,18 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
 #pragma unroll
     for (int i = 0; i < QR4_K*VDR_Q4_K_Q8_1_MMQ/QI8_1; ++i) {
         int sumi_d = 0;
+        int sumi_m = 0;
 
 #pragma unroll
         for (int j = 0; j < QI8_1; ++j) {
             sumi_d = ggml_cuda_dp4a((v[j] >> (4*i)) & 0x0F0F0F0F, u[i*QI8_1 + j], sumi_d); // SIMD dot product
+            sumi_m = ggml_cuda_dp4a(0x01010101, u[i*QI8_1 + j], sumi_m);
         }
 
-        const float2 ds8f = __half22float2(ds8[i]);
+        const float d8 = __low2float(ds8[i]);
 
-        sumf_d += ds8f.x * (sc[i] * sumi_d);
-        sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
+        sumf_d += d8 * (sc[i] * sumi_d);
+        sumf_m += d8 * (m[i]  * sumi_m); // compute sum in f32*i32 to avoid fp16 ds8.y overflow (>65504)
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -604,16 +606,18 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
 #pragma unroll
     for (int i = 0; i < QR5_K*VDR_Q5_K_Q8_1_MMQ/QI8_1; ++i) {
         int sumi_d = 0;
+        int sumi_m = 0;
 
 #pragma unroll
         for (int j = 0; j < QI8_1; ++j) {
             sumi_d = ggml_cuda_dp4a(v[i*QI8_1 + j], u[i*QI8_1 + j], sumi_d); // SIMD dot product
+            sumi_m = ggml_cuda_dp4a(0x01010101, u[i*QI8_1 + j], sumi_m);
         }
 
-        const float2 ds8f = __half22float2(ds8[i]);
+        const float d8 = __low2float(ds8[i]);
 
-        sumf_d += ds8f.x * (sc[i] * sumi_d);
-        sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
+        sumf_d += d8 * (sc[i] * sumi_d);
+        sumf_m += d8 * (m[i]  * sumi_m);
     }
 
     const float2 dm4f = __half22float2(dm4);

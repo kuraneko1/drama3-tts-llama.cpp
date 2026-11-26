@@ -56,7 +56,8 @@ ggml_tensor * mtmd_graph_qwen3tts_gen::code_gen::do_sampling(ggml_tensor * logit
     ggml_tensor * diff       = ggml_sub(ctx0, cumsum, inp_rand);
     ggml_tensor * cross_mask = ggml_step(ctx0, diff);
     ggml_tensor * idxf       = ggml_sum(ctx0, cross_mask);
-    ggml_tensor * idx        = ggml_cast(ctx0, ggml_scale_bias(ctx0, idxf, -1.0f, (float) cross_mask->ne[0]), GGML_TYPE_I32);
+    ggml_tensor * idx_raw    = ggml_scale_bias(ctx0, idxf, -1.0f, (float) cross_mask->ne[0]);
+    ggml_tensor * idx        = ggml_cast(ctx0, ggml_clamp(ctx0, idx_raw, 0.0f, (float) cross_mask->ne[0] - 1.0f), GGML_TYPE_I32);
 
     if (candidates) {
         ggml_tensor * cand_2d = ggml_reshape_2d(ctx0, candidates, 1, candidates->ne[0]);
