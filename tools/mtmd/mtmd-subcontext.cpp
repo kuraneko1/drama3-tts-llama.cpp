@@ -649,10 +649,14 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         const bool forced   = params->codes && params->codes->size() == (size_t) (2 * drama3_n_cb);
         const bool emit_out = params->out_embd != nullptr;
         const bool hit = drama3_cache.gf != nullptr &&
-                         drama3_cache.n_kv_ctx  == n_kv_ctx &&
-                         drama3_cache.forced    == forced &&
-                         drama3_cache.emit_out  == emit_out &&
-                         drama3_cache.state_buf == params->gen_state->buf.get();
+                         drama3_cache.n_kv_ctx == n_kv_ctx &&
+                         drama3_cache.forced   == forced &&
+                         drama3_cache.emit_out == emit_out &&
+                         drama3_cache.state_id != 0 &&
+                         drama3_cache.state_id == params->gen_state->id &&
+                         drama3_cache.top_k    == params->top_k &&
+                         drama3_cache.top_p    == params->top_p &&
+                         drama3_cache.temp     == params->temp;
         if (hit) {
             gf         = drama3_cache.gf;
             embeddings = drama3_cache.embeddings;
@@ -686,11 +690,15 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
             drama3_cache.n_kv_ctx   = n_kv_ctx;
             drama3_cache.forced     = forced;
             drama3_cache.emit_out   = emit_out;
-            drama3_cache.state_buf  = params->gen_state->buf.get();
+            drama3_cache.state_id   = params->gen_state->id;
+            drama3_cache.top_k      = params->top_k;
+            drama3_cache.top_p      = params->top_p;
+            drama3_cache.temp       = params->temp;
 
             if (!ggml_backend_sched_alloc_graph(backends.sched.get(), gf)) {
                 drama3_cache.gf = nullptr;
                 drama3_cache.embeddings = nullptr;
+                drama3_cache.state_id = 0;
                 drama3_cache.ctx.reset();
                 LOG_ERR("%s: failed to allocate compute graph\n", __func__);
                 return false;

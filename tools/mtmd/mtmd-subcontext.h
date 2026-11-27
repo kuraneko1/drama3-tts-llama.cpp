@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <random>
@@ -101,6 +102,12 @@ struct mtmd_subctx_enc_state {
 
 // per-sequence state of audio generation: RNG and the slots kept between GEN_WAV calls
 struct mtmd_subctx_gen_state {
+    static uint64_t next_id() {
+        static std::atomic<uint64_t> counter{1};
+        return counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    uint64_t     id = next_id();
     std::mt19937 rng;
 
     ggml_context_ptr        ctx_data;
@@ -237,7 +244,10 @@ private:
         int                   n_kv_ctx    = 0;
         bool                  forced      = false;
         bool                  emit_out    = true;
-        ggml_backend_buffer_t state_buf   = nullptr;
+        uint64_t              state_id    = 0;
+        int32_t               top_k       = 0;
+        float                 top_p       = 0.0f;
+        float                 temp        = 0.0f;
         std::vector<uint8_t>  compute_meta;
         ggml_context_ptr      ctx;
         ggml_cgraph *         gf         = nullptr;
