@@ -16,6 +16,7 @@
 #include "softcap.cuh"
 #include "ssm-conv.cuh"
 #include "ssm-scan.cuh"
+#include "top-k.cuh"
 #include "topk-moe.cuh"
 #include "unary.cuh"
 
@@ -1990,6 +1991,255 @@ static int ggml_cuda_try_fuse_inkling2(ggml_backend_cuda_context * cuda_ctx, ggm
 }
 
 // try and fuse nodes and return the number of nodes to skip
+
+struct ggml_cuda_top_k_top_p_sample_match {
+    const ggml_tensor * logits     = nullptr;
+    const ggml_tensor * rand_val   = nullptr;
+    const ggml_tensor * logits_2d  = nullptr;
+    ggml_tensor *       dst        = nullptr;
+    int                 k          = 0;
+    float               top_p      = 1.0f;
+    int                 node_count = 0;
+};
+
+static bool ggml_cuda_match_top_k_top_p_sample(
+        const ggml_cgraph *                    cgraph,
+        int                                    node_idx,
+        ggml_cuda_top_k_top_p_sample_match &   match) {
+    const ggml_tensor * top_k = cgraph->nodes[node_idx];
+    if (top_k->op != GGML_OP_TOP_K || top_k->type != GGML_TYPE_I32 ||
+            top_k->ne[1] != 1 || top_k->ne[2] != 1 || top_k->ne[3] != 1) {
+        return false;
+    }
+    const int k = (int) top_k->ne[0];
+    if (k < 1 || k > 64) {
+        return false;
+    }
+    const ggml_tensor * logits = top_k->src[0];
+    if (!logits || logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
+            logits->ne[1] != 1 || logits->ne[2] != 1 || logits->ne[3] != 1) {
+        return false;
+    }
+    const int n_vocab = (int) logits->ne[0];
+    if (n_vocab <= k || n_vocab > 8192) {
+        return false;
+    }
+
+    int end_idx = -1;
+    const int max_end = std::min(node_idx + 45, cgraph->n_nodes - 1);
+    for (int p = node_idx + 1; p <= max_end; ++p) {
+        const ggml_tensor * cand_dst = cgraph->nodes[p];
+        if (cand_dst->op == GGML_OP_GET_ROWS && cand_dst->type == GGML_TYPE_I32 &&
+                cand_dst->ne[0] == 1 && cand_dst->ne[1] == 1 && cand_dst->ne[2] == 1 && cand_dst->ne[3] == 1 &&
+                cand_dst->src[0] && cand_dst->src[0]->op == GGML_OP_RESHAPE &&
+                cand_dst->src[1] && cand_dst->src[1]->op == GGML_OP_CPY && cand_dst->src[1]->type == GGML_TYPE_I32) {
+            const ggml_tensor * cand_1d = cand_dst->src[0]->src[0];
+            if (cand_1d && cand_1d->op == GGML_OP_RESHAPE &&
+                    cand_1d->src[0] && cand_1d->src[0]->op == GGML_OP_GET_ROWS &&
+                    cand_1d->src[0]->src[0] && cand_1d->src[0]->src[0]->op == GGML_OP_RESHAPE &&
+                    cand_1d->src[0]->src[0]->src[0] == top_k) {
+                end_idx = p;
+                break;
+            }
+        }
+    }
+    if (end_idx < 0) {
+        return false;
+    }
+
+    ggml_tensor * final_gr = cgraph->nodes[end_idx];
+    const ggml_tensor * cand_2d       = final_gr->src[0];
+    const ggml_tensor * candidates    = cand_2d ? cand_2d->src[0] : nullptr;
+    const ggml_tensor * cand_gr       = candidates ? candidates->src[0] : nullptr;
+    const ggml_tensor * cand_top_k_2d = cand_gr ? cand_gr->src[0] : nullptr;
+    const ggml_tensor * sorted_idx    = cand_gr ? cand_gr->src[1] : nullptr;
+    if (!cand_2d || !candidates || !cand_gr || !cand_top_k_2d || !sorted_idx ||
+            cand_top_k_2d->src[0] != top_k ||
+            sorted_idx->op != GGML_OP_ARGSORT ||
+            ggml_get_op_params_i32(sorted_idx, 0) != GGML_SORT_ORDER_DESC) {
+        return false;
+    }
+
+    const ggml_tensor * cur_topk_1d = sorted_idx->src[0];
+    const ggml_tensor * topk_gr     = (cur_topk_1d && cur_topk_1d->op == GGML_OP_RESHAPE) ? cur_topk_1d->src[0] : nullptr;
+    const ggml_tensor * logits_2d   = (topk_gr && topk_gr->op == GGML_OP_GET_ROWS && topk_gr->src[1] == top_k) ? topk_gr->src[0] : nullptr;
+    if (!logits_2d || logits_2d->op != GGML_OP_RESHAPE || logits_2d->src[0] != logits ||
+            logits_2d->ne[0] != 1 || logits_2d->ne[1] != n_vocab) {
+        return false;
+    }
+
+    const ggml_tensor * idx_cast   = final_gr->src[1];
+    const ggml_tensor * idx_clamp  = (idx_cast && idx_cast->op == GGML_OP_CPY && idx_cast->type == GGML_TYPE_I32) ? idx_cast->src[0] : nullptr;
+    const ggml_tensor * idx_raw    = (idx_clamp && idx_clamp->op == GGML_OP_CLAMP) ? idx_clamp->src[0] : nullptr;
+    const ggml_tensor * idxf_d     = (idx_raw && idx_raw->op == GGML_OP_SCALE) ? idx_raw->src[0] : nullptr;
+    const ggml_tensor * cross_mask = (idxf_d && idxf_d->op == GGML_OP_SUM) ? idxf_d->src[0] : nullptr;
+    const ggml_tensor * diff       = (cross_mask && cross_mask->op == GGML_OP_UNARY && ggml_get_unary_op(cross_mask) == GGML_UNARY_OP_STEP) ? cross_mask->src[0] : nullptr;
+    if (!diff || diff->op != GGML_OP_SUB) {
+        return false;
+    }
+    if (ggml_get_op_params_f32(idx_clamp, 0) != 0.0f || ggml_get_op_params_f32(idx_clamp, 1) != (float) (k - 1) ||
+            ggml_get_op_params_f32(idx_raw, 0) != -1.0f || ggml_get_op_params_f32(idx_raw, 1) != (float) k) {
+        return false;
+    }
+
+    const ggml_tensor * cumsum_d  = diff->src[0];
+    const ggml_tensor * rand_view = diff->src[1];
+    if (!rand_view || rand_view->type != GGML_TYPE_F32 || !ggml_is_contiguous(rand_view) || ggml_nelements(rand_view) != 1) {
+        return false;
+    }
+    const ggml_tensor * probs_d  = (cumsum_d && cumsum_d->op == GGML_OP_CUMSUM) ? cumsum_d->src[0] : nullptr;
+    const ggml_tensor * cur_topp = (probs_d && probs_d->op == GGML_OP_SOFT_MAX && probs_d->src[1] == nullptr &&
+                                    ggml_get_op_params_f32(probs_d, 0) == 1.0f) ? probs_d->src[0] : nullptr;
+    if (!cur_topp || cur_topp->op != GGML_OP_ADD) {
+        return false;
+    }
+
+    const ggml_tensor * sorted_logits = cur_topp->src[0];
+    const ggml_tensor * bias          = cur_topp->src[1];
+    const ggml_tensor * sl_gr         = (sorted_logits && sorted_logits->op == GGML_OP_RESHAPE) ? sorted_logits->src[0] : nullptr;
+    const ggml_tensor * sl_2d         = (sl_gr && sl_gr->op == GGML_OP_GET_ROWS && sl_gr->src[1] == sorted_idx) ? sl_gr->src[0] : nullptr;
+    if (!sl_2d || sl_2d->op != GGML_OP_RESHAPE || sl_2d->src[0] != cur_topk_1d) {
+        return false;
+    }
+
+    const ggml_tensor * keep_mask_1    = (bias && bias->op == GGML_OP_LOG) ? bias->src[0] : nullptr;
+    const ggml_tensor * keep_mask_2d_1 = (keep_mask_1 && keep_mask_1->op == GGML_OP_RESHAPE) ? keep_mask_1->src[0] : nullptr;
+    if (!keep_mask_2d_1 || keep_mask_2d_1->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+    const ggml_tensor * ones           = keep_mask_2d_1->src[0];
+    const ggml_tensor * cast_p         = keep_mask_2d_1->src[1];
+    const ggml_tensor * keep_mask_2d_0 = keep_mask_2d_1->src[2];
+    const ggml_tensor * idxf_clamp_p   = (ones && ones->op == GGML_OP_SCALE &&
+                                          ggml_get_op_params_f32(ones, 0) == 0.0f &&
+                                          ggml_get_op_params_f32(ones, 1) == 1.0f) ? ones->src[0] : nullptr;
+    if (!cast_p || cast_p->op != GGML_OP_CPY || cast_p->type != GGML_TYPE_I32 || cast_p->src[0] != idxf_clamp_p ||
+            !idxf_clamp_p || idxf_clamp_p->op != GGML_OP_CLAMP ||
+            ggml_get_op_params_f32(idxf_clamp_p, 0) != 0.0f || ggml_get_op_params_f32(idxf_clamp_p, 1) != (float) (k - 1)) {
+        return false;
+    }
+    const ggml_tensor * idxf_p      = idxf_clamp_p->src[0];
+    const ggml_tensor * keep_mask_0 = (idxf_p && idxf_p->op == GGML_OP_SUM) ? idxf_p->src[0] : nullptr;
+    if (!keep_mask_2d_0 || keep_mask_2d_0->op != GGML_OP_RESHAPE || keep_mask_2d_0->src[0] != keep_mask_0) {
+        return false;
+    }
+    const ggml_tensor * cdf_scaled = (keep_mask_0 && keep_mask_0->op == GGML_OP_UNARY && ggml_get_unary_op(keep_mask_0) == GGML_UNARY_OP_STEP) ? keep_mask_0->src[0] : nullptr;
+    const ggml_tensor * cdf_p      = (cdf_scaled && cdf_scaled->op == GGML_OP_SCALE && ggml_get_op_params_f32(cdf_scaled, 0) == -1.0f) ? cdf_scaled->src[0] : nullptr;
+    const float top_p = cdf_scaled ? ggml_get_op_params_f32(cdf_scaled, 1) : 1.0f;
+    if (!(top_p > 0.0f && top_p < 1.0f)) {
+        return false;
+    }
+    const ggml_tensor * probs_p = (cdf_p && cdf_p->op == GGML_OP_CUMSUM) ? cdf_p->src[0] : nullptr;
+    if (!probs_p || probs_p->op != GGML_OP_SOFT_MAX || probs_p->src[0] != sorted_logits ||
+            probs_p->src[1] != nullptr || ggml_get_op_params_f32(probs_p, 0) != 1.0f) {
+        return false;
+    }
+
+    const ggml_tensor * expected[] = {
+        top_k, logits_2d, topk_gr, cur_topk_1d, sorted_idx, cand_top_k_2d, cand_gr, candidates, cand_2d,
+        sl_2d, sl_gr, sorted_logits, probs_p, cdf_p, cdf_scaled, keep_mask_0, idxf_p, idxf_clamp_p, ones,
+        cast_p, keep_mask_2d_0, keep_mask_2d_1, keep_mask_1, bias, cur_topp, probs_d, cumsum_d,
+        rand_view, diff, cross_mask, idxf_d, idx_raw, idx_clamp, idx_cast, final_gr
+    };
+
+    for (int p = node_idx; p <= end_idx; ++p) {
+        const ggml_tensor * t = cgraph->nodes[p];
+        bool in_expected = false;
+        for (const ggml_tensor * e : expected) {
+            if (t == e) {
+                in_expected = true;
+                break;
+            }
+        }
+        if (!in_expected) {
+            bool is_sched_src_view = (t->op == GGML_OP_VIEW && t->type == GGML_TYPE_F32 && ggml_nelements(t) == 1 &&
+                                      (t->flags & GGML_TENSOR_FLAG_OUTPUT) == 0);
+            if (is_sched_src_view) {
+                for (int q = 0; q < cgraph->n_nodes; ++q) {
+                    const ggml_tensor * outer = cgraph->nodes[q];
+                    if (outer->view_src == t && q != p) {
+                        is_sched_src_view = false;
+                        break;
+                    }
+                    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                        if (outer->src[s] == t) {
+                            is_sched_src_view = false;
+                            break;
+                        }
+                    }
+                    if (!is_sched_src_view) {
+                        break;
+                    }
+                }
+            }
+            if (!is_sched_src_view) {
+                return false;
+            }
+        }
+        if (t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW && (t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+        if (p < end_idx) {
+            if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
+                return false;
+            }
+            for (int q = 0; q < cgraph->n_nodes; ++q) {
+                if (q >= node_idx && q <= end_idx) {
+                    continue;
+                }
+                const ggml_tensor * outer = cgraph->nodes[q];
+                if (outer->view_src == t) {
+                    return false;
+                }
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (outer->src[s] == t) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    for (const ggml_tensor * e : expected) {
+        bool found = false;
+        for (int p = node_idx; p <= end_idx; ++p) {
+            if (cgraph->nodes[p] == e) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (e == rand_view) {
+                continue;
+            }
+            if (e == logits_2d) {
+                for (int q = 0; q < cgraph->n_nodes; ++q) {
+                    const ggml_tensor * outer = cgraph->nodes[q];
+                    if (outer != topk_gr && outer->view_src == e) {
+                        return false;
+                    }
+                    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                        if (outer->src[s] == e && outer != topk_gr) {
+                            return false;
+                        }
+                    }
+                }
+                continue;
+            }
+            return false;
+        }
+    }
+
+    match.logits     = logits;
+    match.rand_val   = rand_view;
+    match.logits_2d  = logits_2d;
+    match.dst        = final_gr;
+    match.k          = k;
+    match.top_p      = top_p;
+    match.node_count = end_idx - node_idx + 1;
+    return true;
+}
+
 int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     if (int n = ggml_cuda_try_fuse_inkling2(cuda_ctx, cgraph, i)) {
         return n;
@@ -2831,6 +3081,17 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
         return 2;
     }
 
+    if (node->op == GGML_OP_TOP_K) {
+        ggml_cuda_top_k_top_p_sample_match match;
+        if (ggml_cuda_match_top_k_top_p_sample(cgraph, i, match)) {
+            const int out_idx = i + match.node_count - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &out_idx, 1)) {
+                ggml_cuda_op_top_k_top_p_sample_fused(*cuda_ctx, match.logits, match.rand_val, match.dst, match.k, match.top_p);
+                return match.node_count - 1;
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -2906,6 +3167,21 @@ void ggml_cuda_fusion_add_alloc_deps(ggml_backend_cuda_context * cuda_ctx, ggml_
                     ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[i + 6], cgraph->nodes[i + 7], cgraph->nodes[i + 8], up_scale, cgraph->nodes[i + 5])) {
                 add_alloc_deps(i, i + 10);
                 i += 10;
+                continue;
+            }
+        }
+
+        if (cgraph->nodes[i]->op == GGML_OP_TOP_K) {
+            ggml_cuda_top_k_top_p_sample_match match;
+            if (ggml_cuda_match_top_k_top_p_sample(cgraph, i, match)) {
+                add_alloc_deps(i, i + match.node_count - 1);
+                for (const ggml_tensor * dep = match.logits; dep; dep = dep->view_src) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(dep), match.dst);
+                }
+                for (const ggml_tensor * dep = match.rand_val; dep; dep = dep->view_src) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(dep), match.dst);
+                }
+                i += match.node_count - 1;
                 continue;
             }
         }

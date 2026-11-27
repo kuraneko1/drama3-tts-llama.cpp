@@ -242,6 +242,11 @@ private:
         ggml_context_ptr      ctx;
         ggml_cgraph *         gf         = nullptr;
         ggml_tensor *         embeddings = nullptr;
+
+        // persistent host staging buffers for async HtoD transfers during single-row decode
+        std::vector<float>        h_raw, h_scale, h_rand, h_mask_f32;
+        std::vector<int32_t>      h_code0, h_extra, h_pos, h_force;
+        std::vector<ggml_fp16_t>  h_mask_f16;
     } drama3_cache;
 
     // only initialize backend buffers, but do not allocate them yet

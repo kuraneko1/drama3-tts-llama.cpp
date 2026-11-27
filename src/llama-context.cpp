@@ -1696,6 +1696,12 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_output_vocab_range(int32_t start, int32_t count) {
+    GGML_ASSERT(start >= 0 && count >= 0);
+    cparams.output_vocab_start = count > 0 ? start : 0;
+    cparams.output_vocab_count = count;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1995,7 +2001,19 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_outputs*n_vocab*sizeof(float));
+        const int64_t t_n_vocab = t_logits->ne[0];
+        if (t_n_vocab != n_vocab) {
+            GGML_ASSERT(cparams.output_vocab_count > 0 && t_n_vocab == cparams.output_vocab_count);
+            GGML_ASSERT(cparams.output_vocab_start >= 0 && cparams.output_vocab_start + t_n_vocab <= n_vocab);
+            for (int32_t o = 0; o < n_outputs; ++o) {
+                ggml_backend_tensor_get_async(backend_res, t_logits,
+                    logits.data + (size_t) o * n_vocab + cparams.output_vocab_start,
+                    (size_t) o * t_n_vocab * sizeof(float),
+                    (size_t) t_n_vocab * sizeof(float));
+            }
+        } else {
+            ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_outputs*n_vocab*sizeof(float));
+        }
     }
 
     // extract embeddings
@@ -2428,7 +2446,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                const int64_t t_n_vocab = t_logits->ne[0];
+                if (t_n_vocab != n_vocab) {
+                    GGML_ASSERT(cparams.output_vocab_count > 0 && t_n_vocab == cparams.output_vocab_count);
+                    GGML_ASSERT(cparams.output_vocab_start >= 0 && cparams.output_vocab_start + t_n_vocab <= n_vocab);
+                    for (int32_t o = 0; o < n_outputs; ++o) {
+                        ggml_backend_tensor_get_async(backend_res, t_logits,
+                            logits_out + (size_t) o * n_vocab + cparams.output_vocab_start,
+                            (size_t) o * t_n_vocab * sizeof(float),
+                            (size_t) t_n_vocab * sizeof(float));
+                    }
+                } else {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
             }
         }
 
@@ -4661,6 +4691,12 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+void llama_set_output_vocab_range(llama_context * ctx, int32_t start, int32_t count) {
+    if (ctx) {
+        ctx->set_output_vocab_range(start, count);
+    }
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

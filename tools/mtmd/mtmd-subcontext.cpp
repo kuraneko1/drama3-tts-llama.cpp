@@ -439,7 +439,7 @@ mtmd_subctx_gen_state * mtmd_subcontext::gen_state_init(uint32_t seed) {
     };
     st->ctx_data.reset(ggml_init(params));
     for (const auto & slot : slots) {
-        ggml_tensor * t = ggml_new_tensor_2d(st->ctx_data.get(), GGML_TYPE_F32, slot.ne0, slot.ne1);
+        ggml_tensor * t = ggml_new_tensor_2d(st->ctx_data.get(), slot.type, slot.ne0, slot.ne1);
         ggml_format_name(t, "gen_state_%s", slot.name.c_str());
         st->slots.push_back(t);
     }
@@ -734,32 +734,42 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         return inp;
     };
 
-    auto set_input_f32 = [&get_inp_tensor](const char * name, const std::vector<float> & values) {
-        ggml_tensor * cur = get_inp_tensor(name);
-        GGML_ASSERT(cur->type == GGML_TYPE_F32);
-        GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
-        ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
-    };
-
-    // mask from build_inp_attn_mask(), f16 if flash attn is enabled
-    auto set_input_attn_mask = [&get_inp_tensor](const std::vector<float> & values, int idx = 0) {
-        ggml_tensor * cur = get_inp_tensor(get_attn_mask_name(idx).c_str());
-        GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
-        if (cur->type == GGML_TYPE_F16) {
-            std::vector<ggml_fp16_t> values_f16(values.size());
-            ggml_fp32_to_fp16_row(values.data(), values_f16.data(), values.size());
-            ggml_backend_tensor_set(cur, values_f16.data(), 0, ggml_nbytes(cur));
+    auto set_tensor_data = [&](ggml_tensor * cur, const void * data, size_t nbytes, bool async_ok) {
+        if (async_ok && backends.backend != backends.backend_cpu &&
+                ggml_backend_sched_get_tensor_backend(backends.sched.get(), cur) == backends.backend) {
+            ggml_backend_tensor_set_async(backends.backend, cur, data, 0, nbytes);
         } else {
-            GGML_ASSERT(cur->type == GGML_TYPE_F32);
-            ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
+            ggml_backend_tensor_set(cur, data, 0, nbytes);
         }
     };
 
-    auto set_input_i32 = [&get_inp_tensor](const char * name, std::vector<int32_t> & values) {
+    auto set_input_f32 = [&](const char * name, const std::vector<float> & values, bool async_ok = false) {
+        ggml_tensor * cur = get_inp_tensor(name);
+        GGML_ASSERT(cur->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
+        set_tensor_data(cur, values.data(), ggml_nbytes(cur), async_ok);
+    };
+
+    // mask from build_inp_attn_mask(), f16 if flash attn is enabled
+    auto set_input_attn_mask = [&](const std::vector<float> & values, int idx = 0, bool async_ok = false) {
+        ggml_tensor * cur = get_inp_tensor(get_attn_mask_name(idx).c_str());
+        GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
+        if (cur->type == GGML_TYPE_F16) {
+            auto & values_f16 = drama3_cache.h_mask_f16;
+            values_f16.resize(values.size());
+            ggml_fp32_to_fp16_row(values.data(), values_f16.data(), values.size());
+            set_tensor_data(cur, values_f16.data(), ggml_nbytes(cur), async_ok);
+        } else {
+            GGML_ASSERT(cur->type == GGML_TYPE_F32);
+            set_tensor_data(cur, values.data(), ggml_nbytes(cur), async_ok);
+        }
+    };
+
+    auto set_input_i32 = [&](const char * name, std::vector<int32_t> & values, bool async_ok = false) {
         ggml_tensor * cur = get_inp_tensor(name);
         GGML_ASSERT(cur->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_nelements(cur) == (int64_t)values.size());
-        ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
+        set_tensor_data(cur, values.data(), ggml_nbytes(cur), async_ok);
     };
 
     // state of the previous call, zero on a cold start
@@ -909,7 +919,12 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
         const int n_mel  = mel_inp.ny();
         GGML_ASSERT((size_t)n_step * n_mel == buf.size());
 
-        set_input_f32("inp_raw", buf);
+        if (can_cache_drama3) {
+            drama3_cache.h_raw = buf;
+            set_input_f32("inp_raw", drama3_cache.h_raw, true);
+        } else {
+            set_input_f32("inp_raw", buf);
+        }
     }
 
     // set input per projector
@@ -2081,11 +2096,16 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                     const int pos      = params->gen_state->tower_pos;
                     const int n_kv_ctx = mtmd_graph_drama3_gen::kv_bucket(pos + n_rows);
 
-                    std::vector<int32_t> code0((size_t) n_rows);
-                    std::vector<int32_t> extra((size_t) n_rows * (size_t) (n_cb - 2));
-                    std::vector<float>   scale((size_t) n_rows * 2);
-                    std::vector<int32_t> inp_pos((size_t) n_rows);
-                    std::vector<int32_t> force(forced ? (size_t) n_rows * (size_t) n_heads : 0);
+                    auto & code0   = drama3_cache.h_code0;
+                    auto & extra   = drama3_cache.h_extra;
+                    auto & scale   = drama3_cache.h_scale;
+                    auto & inp_pos = drama3_cache.h_pos;
+                    auto & force   = drama3_cache.h_force;
+                    code0.resize((size_t) n_rows);
+                    extra.resize((size_t) n_rows * (size_t) (n_cb - 2));
+                    scale.resize((size_t) n_rows * 2);
+                    inp_pos.resize((size_t) n_rows);
+                    force.resize(forced ? (size_t) n_rows * (size_t) n_heads : 0);
 
                     for (int r = 0; r < n_rows; r++) {
                         bool next_speech = false;
@@ -2118,26 +2138,29 @@ bool mtmd_subcontext::encode(mtmd_subctx_encode_params * params) {
                         inp_pos[(size_t) r]                = pos + r;
                     }
 
-                    set_input_i32("inp_code0", code0);
-                    set_input_i32("inp_extra", extra);
-                    set_input_f32("inp_scale", scale);
-                    set_input_i32("inp_pos", inp_pos);
+                    const bool async_ok = can_cache_drama3;
+                    set_input_i32("inp_code0", code0, async_ok);
+                    set_input_i32("inp_extra", extra, async_ok);
+                    set_input_f32("inp_scale", scale, async_ok);
+                    set_input_i32("inp_pos", inp_pos, async_ok);
 
-                    std::vector<float> attn_mask((size_t) n_kv_ctx * (size_t) n_rows, -INFINITY);
+                    auto & attn_mask = drama3_cache.h_mask_f32;
+                    attn_mask.assign((size_t) n_kv_ctx * (size_t) n_rows, -INFINITY);
                     for (int q = 0; q < n_rows; q++) {
                         std::fill_n(attn_mask.data() + (size_t) q * (size_t) n_kv_ctx, pos + q + 1, 0.0f);
                     }
-                    set_input_attn_mask(attn_mask);
+                    set_input_attn_mask(attn_mask, 0, async_ok);
 
                     if (forced) {
-                        set_input_i32("inp_force", force);
+                        set_input_i32("inp_force", force, async_ok);
                     } else {
                         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-                        std::vector<float> r(n_heads);
+                        auto & r = drama3_cache.h_rand;
+                        r.resize(n_heads);
                         for (auto & v : r) {
                             v = dist(params->gen_state->rng);
                         }
-                        set_input_f32("inp_rand", r);
+                        set_input_f32("inp_rand", r, async_ok);
                     }
                 }
             } break;

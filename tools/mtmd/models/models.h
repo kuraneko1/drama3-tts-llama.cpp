@@ -661,6 +661,7 @@ struct c2w_state_slot {
     int64_t     ne0;
     int64_t     ne1;
     bool        in_place = false; // graph writes the slot directly, no state_in/state_out copy
+    ggml_type   type     = GGML_TYPE_F32;
 };
 std::vector<c2w_state_slot> list_c2w_state_slots(const mtmd_hparams & hparams, const mtmd_model & model);
 

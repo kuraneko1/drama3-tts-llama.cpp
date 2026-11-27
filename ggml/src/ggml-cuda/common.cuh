@@ -1499,6 +1499,64 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    struct q8_1_cache_entry {
+        const void * src_data;
+        size_t       src_bytes;
+        ggml_type    src_type;
+        int64_t      ne10, ne11, ne12, ne13;
+        int64_t      s11, s12, s13;
+        char *       q8_1_ptr;
+    };
+
+    void *  q8_1_cache_buf  = nullptr;
+    size_t  q8_1_cache_cap  = 0;
+    size_t  q8_1_cache_used = 0;
+    std::vector<q8_1_cache_entry> q8_1_cache;
+
+    void q8_1_cache_reset() {
+        q8_1_cache_used = 0;
+        q8_1_cache.clear();
+    }
+
+    void q8_1_cache_ensure(size_t bytes) {
+        if (bytes <= q8_1_cache_cap) {
+            return;
+        }
+        ggml_cuda_set_device(device);
+        if (q8_1_cache_buf != nullptr) {
+            CUDA_CHECK(cudaFree(q8_1_cache_buf));
+            q8_1_cache_buf = nullptr;
+            q8_1_cache_cap = 0;
+        }
+        void * ptr = nullptr;
+        CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        q8_1_cache_buf = ptr;
+        q8_1_cache_cap = bytes;
+        q8_1_cache_reset();
+    }
+
+    void q8_1_cache_invalidate_range(const void * ptr, size_t bytes) {
+        if (!ptr || bytes == 0 || q8_1_cache.empty()) {
+            return;
+        }
+        const uintptr_t w_start = (uintptr_t) ptr;
+        const uintptr_t w_end   = w_start + bytes;
+        size_t out = 0;
+        for (size_t k = 0; k < q8_1_cache.size(); ++k) {
+            const auto & e = q8_1_cache[k];
+            const uintptr_t e_start = (uintptr_t) e.src_data;
+            const uintptr_t e_end   = e_start + e.src_bytes;
+            if (!(w_end <= e_start || e_end <= w_start)) {
+                continue;
+            }
+            if (out != k) {
+                q8_1_cache[out] = e;
+            }
+            ++out;
+        }
+        q8_1_cache.resize(out);
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {

@@ -942,6 +942,11 @@ struct llm_graph_params {
             return false;
         }
 
+        if (cparams.output_vocab_start != other.cparams.output_vocab_start ||
+            cparams.output_vocab_count != other.cparams.output_vocab_count) {
+            return false;
+        }
+
         if (!samplers_equal(samplers, other.samplers)) {
             return false;
         }

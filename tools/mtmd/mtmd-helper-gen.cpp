@@ -2735,7 +2735,16 @@ class drama3_gen_audio_pipeline : public mtmd_gen_audio_pipeline {
 public:
     using mtmd_gen_audio_pipeline::mtmd_gen_audio_pipeline;
 
+    ~drama3_gen_audio_pipeline() override {
+        if (lctx) {
+            llama_set_output_vocab_range(lctx, 0, 0);
+        }
+    }
+
     void reset() override {
+        if (lctx) {
+            llama_set_output_vocab_range(lctx, 0, 0);
+        }
         seq_id = 0;
         pos = 0;
         prompt_tokens.clear();
@@ -2781,6 +2790,11 @@ public:
                 sem_begin + n_cb_vocab > llama_vocab_n_tokens(vocab)) {
             LOG_ERR("mtmd_helper_gen_audio: missing semantic tokens in vocab\n");
             return 1;
+        }
+        {
+            const int32_t lo = std::min(eos, sem_begin);
+            const int32_t hi = std::max(eos, sem_begin + n_cb_vocab - 1);
+            llama_set_output_vocab_range(lctx, lo, hi - lo + 1);
         }
 
         const std::string text(inp->prompt, inp->prompt_len);
@@ -2849,8 +2863,10 @@ public:
         }
         pos        += n;
         prompt_pos += n;
-        if (prompt_pos == n_prompt && !prompt_h_buf.empty() && !run_prompt_tower_batch()) {
-            return -1;
+        if (prompt_pos == n_prompt && !prompt_h_buf.empty()) {
+            if (!run_prompt_tower_batch()) {
+                return -1;
+            }
         }
         return n_prompt - prompt_pos;
     }

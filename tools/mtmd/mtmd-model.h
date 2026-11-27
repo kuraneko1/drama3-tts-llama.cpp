@@ -894,6 +894,7 @@ struct mtmd_drama3_layer {
     ggml_tensor * eh_proj_w  = nullptr; // [code embd; hidden] -> hidden
     ggml_tensor * embd_w     = nullptr;
     ggml_tensor * out_norm_w = nullptr;
+    ggml_tensor * qkvg_w     = nullptr; // fused [q_w; k_w; v_w; attn_gate_w] for n_rows == 1 decode
 };
 
 // zonos3 ZAC codec decoder (a.gen.wav.*)
@@ -1159,6 +1160,8 @@ struct mtmd_model {
     // weights
     ggml_context_ptr        ctx_data;
     ggml_backend_buffer_ptr buf;
+    ggml_context_ptr        ctx_drama3_fused;
+    ggml_backend_buffer_ptr buf_drama3_fused;
     std::map<ggml_backend_dev_t, size_t> mem_weights;
 
     // embeddings

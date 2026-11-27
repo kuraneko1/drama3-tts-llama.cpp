@@ -583,8 +583,12 @@ ggml_tensor * mtmd_graph::build_attn(
     if (flash_attn_type == MTMD_FLASH_ATTN_TYPE_ENABLED) {
         ggml_tensor * v = ggml_permute(ctx0, v_cur, 0, 2, 1, 3);
 
-        k = ggml_cast(ctx0, k, GGML_TYPE_F16);
-        v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        if (k->type != GGML_TYPE_F16) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
+        if (v->type != GGML_TYPE_F16) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
         // mask must be f16 here, use build_inp_attn_mask()
         GGML_ASSERT(!kq_mask || kq_mask->type == GGML_TYPE_F16);
 

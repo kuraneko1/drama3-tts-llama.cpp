@@ -4479,6 +4479,66 @@ struct mtmd_model_loader {
                 LOG_DBG("%s: no_alloc is set, skipping tensor data loading (%zu tensors)\n", __func__, tensors_to_load.size());
             }
             fin.close();
+
+            if (model.proj_type == PROJECTOR_TYPE_DRAMA3_GEN && !no_alloc && !model.drama3_layers.empty()) {
+                bool can_fuse = model.layers.size() == model.drama3_layers.size();
+                for (size_t il = 0; il < model.layers.size() && can_fuse; ++il) {
+                    const auto & l = model.layers[il];
+                    if (!l.q_w || !l.k_w || !l.v_w || !l.attn_gate_w ||
+                        l.q_w->type != GGML_TYPE_F16 || l.k_w->type != GGML_TYPE_F16 ||
+                        l.v_w->type != GGML_TYPE_F16 || l.attn_gate_w->type != GGML_TYPE_F16 ||
+                        l.q_w->ne[0] != l.k_w->ne[0] || l.q_w->ne[0] != l.v_w->ne[0] ||
+                        l.q_w->ne[0] != l.attn_gate_w->ne[0]) {
+                        can_fuse = false;
+                    }
+                }
+                if (can_fuse) {
+                    struct ggml_init_params fparams = {
+                        /*.mem_size   =*/ ggml_tensor_overhead() * model.layers.size(),
+                        /*.mem_buffer =*/ nullptr,
+                        /*.no_alloc   =*/ true,
+                    };
+                    model.ctx_drama3_fused.reset(ggml_init(fparams));
+                    for (size_t il = 0; il < model.layers.size(); ++il) {
+                        const auto & l = model.layers[il];
+                        const int64_t ne1_total = l.q_w->ne[1] + l.k_w->ne[1] + l.v_w->ne[1] + l.attn_gate_w->ne[1];
+                        ggml_tensor * t = ggml_new_tensor_2d(model.ctx_drama3_fused.get(), l.q_w->type, l.q_w->ne[0], ne1_total);
+                        ggml_format_name(t, "a.gen.code.blk.%zu.qkvg.weight", il);
+                        model.drama3_layers[il].qkvg_w = t;
+                    }
+                    model.buf_drama3_fused.reset(ggml_backend_alloc_ctx_tensors_from_buft(model.ctx_drama3_fused.get(), buft));
+                    if (model.buf_drama3_fused) {
+                        model.mem_weights[ggml_backend_buft_get_device(buft)] += ggml_backend_buffer_get_size(model.buf_drama3_fused.get());
+                        std::vector<uint8_t> pack_buf;
+                        for (size_t il = 0; il < model.layers.size(); ++il) {
+                            const auto & l = model.layers[il];
+                            ggml_tensor * dst = model.drama3_layers[il].qkvg_w;
+                            const size_t nbytes = ggml_nbytes(dst);
+                            pack_buf.resize(nbytes);
+                            size_t off = 0;
+                            for (ggml_tensor * src : { l.q_w, l.k_w, l.v_w, l.attn_gate_w }) {
+                                const size_t sb = ggml_nbytes(src);
+                                if (ggml_backend_buft_is_host(buft)) {
+                                    memcpy(pack_buf.data() + off, src->data, sb);
+                                } else {
+                                    ggml_backend_tensor_get(src, pack_buf.data() + off, 0, sb);
+                                }
+                                off += sb;
+                            }
+                            if (ggml_backend_buft_is_host(buft)) {
+                                memcpy(dst->data, pack_buf.data(), nbytes);
+                            } else {
+                                ggml_backend_tensor_set(dst, pack_buf.data(), 0, nbytes);
+                            }
+                        }
+                    } else {
+                        for (auto & tl : model.drama3_layers) {
+                            tl.qkvg_w = nullptr;
+                        }
+                        model.ctx_drama3_fused.reset();
+                    }
+                }
+            }
         }
 
     }

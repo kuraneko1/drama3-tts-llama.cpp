@@ -2335,11 +2335,181 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+    load_tensors_qwen35moe_merged();
 
     return true;
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
+
+void llama_model_base::load_tensors_qwen35moe_merged() {
+    if (arch != LLM_ARCH_QWEN35MOE || !hdmd.weight_blocks.empty()) {
+        return;
+    }
+
+    auto resolve_buft = [](const ggml_tensor * t) -> ggml_backend_buffer_type_t {
+        if (!t || !t->buffer) {
+            return nullptr;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+        if (!buft) {
+            return nullptr;
+        }
+        if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                // Skip CPU extra/repack buffer types.
+                if (buft != ggml_backend_dev_buffer_type(dev)) {
+                    return nullptr;
+                }
+            }
+        }
+        return buft;
+    };
+
+    struct merge_item {
+        ggml_tensor **              dst_slot;
+        std::vector<ggml_tensor *>  srcs;
+        ggml_type                   type;
+        int64_t                     ne0;
+        int64_t                     ne1;
+        char                        name[GGML_MAX_NAME];
+    };
+
+    std::unordered_map<ggml_backend_buffer_type_t, std::vector<merge_item>> by_buft;
+
+    for (size_t il = 0; il < layers.size(); ++il) {
+        auto & layer = layers[il];
+
+        // 1. Merge MoE router + shared expert gate (F32)
+        if (layer.ffn_gate_inp && layer.ffn_gate_inp_shexp &&
+                layer.ffn_gate_inp->type == GGML_TYPE_F32 &&
+                layer.ffn_gate_inp_shexp->type == GGML_TYPE_F32 &&
+                layer.ffn_gate_inp->ne[0] == layer.ffn_gate_inp_shexp->ne[0] &&
+                layer.ffn_gate_inp->ne[2] == 1 && layer.ffn_gate_inp->ne[3] == 1 &&
+                layer.ffn_gate_inp_shexp->ne[1] == 1 &&
+                layer.ffn_gate_inp_shexp->ne[2] == 1 && layer.ffn_gate_inp_shexp->ne[3] == 1 &&
+                ggml_is_contiguous(layer.ffn_gate_inp) &&
+                ggml_is_contiguous(layer.ffn_gate_inp_shexp)) {
+            auto b0 = resolve_buft(layer.ffn_gate_inp);
+            auto b1 = resolve_buft(layer.ffn_gate_inp_shexp);
+            if (b0 && b0 == b1) {
+                merge_item it{};
+                it.dst_slot = &layer.ffn_gate_inp_all;
+                it.srcs     = { layer.ffn_gate_inp, layer.ffn_gate_inp_shexp };
+                it.type     = GGML_TYPE_F32;
+                it.ne0      = layer.ffn_gate_inp->ne[0];
+                it.ne1      = layer.ffn_gate_inp->ne[1] + 1;
+                snprintf(it.name, sizeof(it.name), "blk.%zu.ffn_gate_inp_all.weight", il);
+                by_buft[b0].push_back(std::move(it));
+            }
+        }
+
+        // 2. Merge linear-attention wqkv_gate + ssm_alpha + ssm_beta
+        if (layer.wqkv_gate && layer.ssm_alpha && layer.ssm_beta &&
+                !layer.wqkv_gate_b && !layer.wqkv_gate_s && !layer.wqkv_gate_in_s &&
+                !layer.ssm_alpha_s && !layer.ssm_alpha_in_s &&
+                !layer.ssm_beta_s  && !layer.ssm_beta_in_s &&
+                layer.wqkv_gate->type == layer.ssm_alpha->type &&
+                layer.wqkv_gate->type == layer.ssm_beta->type &&
+                layer.wqkv_gate->ne[0] == layer.ssm_alpha->ne[0] &&
+                layer.wqkv_gate->ne[0] == layer.ssm_beta->ne[0] &&
+                layer.wqkv_gate->ne[2] == 1 && layer.wqkv_gate->ne[3] == 1 &&
+                layer.ssm_alpha->ne[2] == 1 && layer.ssm_alpha->ne[3] == 1 &&
+                layer.ssm_beta->ne[2]  == 1 && layer.ssm_beta->ne[3]  == 1 &&
+                ggml_is_contiguous(layer.wqkv_gate) &&
+                ggml_is_contiguous(layer.ssm_alpha) &&
+                ggml_is_contiguous(layer.ssm_beta)) {
+            auto b0 = resolve_buft(layer.wqkv_gate);
+            auto b1 = resolve_buft(layer.ssm_alpha);
+            auto b2 = resolve_buft(layer.ssm_beta);
+            if (b0 && b0 == b1 && b0 == b2) {
+                merge_item it{};
+                it.dst_slot = &layer.wqkv_gate_ab;
+                it.srcs     = { layer.wqkv_gate, layer.ssm_alpha, layer.ssm_beta };
+                it.type     = layer.wqkv_gate->type;
+                it.ne0      = layer.wqkv_gate->ne[0];
+                it.ne1      = layer.wqkv_gate->ne[1] + layer.ssm_alpha->ne[1] + layer.ssm_beta->ne[1];
+                snprintf(it.name, sizeof(it.name), "blk.%zu.wqkv_gate_ab.weight", il);
+                by_buft[b0].push_back(std::move(it));
+            }
+        }
+
+        // 3. Merge GQA wq + wk
+        if (layer.wq && layer.wk &&
+                !layer.wq_b && !layer.wk_b &&
+                !layer.wq_s && !layer.wk_s && !layer.wq_in_s && !layer.wk_in_s &&
+                layer.wq->type == layer.wk->type &&
+                layer.wq->ne[0] == layer.wk->ne[0] &&
+                layer.wq->ne[2] == 1 && layer.wq->ne[3] == 1 &&
+                layer.wk->ne[2] == 1 && layer.wk->ne[3] == 1 &&
+                ggml_is_contiguous(layer.wq) &&
+                ggml_is_contiguous(layer.wk)) {
+            auto b0 = resolve_buft(layer.wq);
+            auto b1 = resolve_buft(layer.wk);
+            if (b0 && b0 == b1) {
+                merge_item it{};
+                it.dst_slot = &layer.wqk;
+                it.srcs     = { layer.wq, layer.wk };
+                it.type     = layer.wq->type;
+                it.ne0      = layer.wq->ne[0];
+                it.ne1      = layer.wq->ne[1] + layer.wk->ne[1];
+                snprintf(it.name, sizeof(it.name), "blk.%zu.wqk.weight", il);
+                by_buft[b0].push_back(std::move(it));
+            }
+        }
+    }
+
+    std::vector<uint8_t> staging;
+    for (auto & [buft, items] : by_buft) {
+        if (items.empty()) {
+            continue;
+        }
+        ggml_init_params gparams = {
+            /*.mem_size   =*/ items.size() * ggml_tensor_overhead() + 1024,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(gparams) };
+        if (!ctx) {
+            continue;
+        }
+        std::vector<ggml_tensor *> created;
+        created.reserve(items.size());
+        for (auto & it : items) {
+            ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), it.type, it.ne0, it.ne1);
+            ggml_set_name(t, it.name);
+            created.push_back(t);
+        }
+        ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+        if (!buffer) {
+            LLAMA_LOG_WARN("%s: unable to allocate %zu merged weights on %s, keeping separate weights\n",
+                           __func__, items.size(), ggml_backend_buft_name(buft));
+            continue;
+        }
+        ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        for (size_t i = 0; i < items.size(); ++i) {
+            ggml_tensor * dst = created[i];
+            const size_t total_bytes = ggml_nbytes(dst);
+            staging.resize(total_bytes);
+            size_t off = 0;
+            for (const ggml_tensor * src : items[i].srcs) {
+                const size_t nb = ggml_nbytes(src);
+                GGML_ASSERT(off + nb <= total_bytes);
+                ggml_backend_tensor_get(src, staging.data() + off, 0, nb);
+                off += nb;
+            }
+            GGML_ASSERT(off == total_bytes);
+            ggml_backend_tensor_set(dst, staging.data(), 0, total_bytes);
+            *(items[i].dst_slot) = dst;
+        }
+
+        std::vector<ggml_backend_buffer_ptr> buffers;
+        buffers.emplace_back(std::move(buffer));
+        pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+    }
+}
+
 void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
     uint32_t hadamard_version = 0;
     ml.get_key(LLM_KV_PRISM_HADAMARD_TIED_OUTPUT, hdmd.tied_output, false);

@@ -12,8 +12,8 @@ std::vector<c2w_state_slot> list_drama3_state_slots(const mtmd_hparams & hparams
     slots.push_back({"tower_pos", 1, 1, true});
     for (size_t il = 0; il < model.layers.size(); il++) {
         const int64_t n_kv = model.layers[il].k_w->ne[1];
-        slots.push_back({"tower_k_" + std::to_string(il), n_kv, mtmd_graph_drama3_gen::n_pos_max, true});
-        slots.push_back({"tower_v_" + std::to_string(il), n_kv, mtmd_graph_drama3_gen::n_pos_max, true});
+        slots.push_back({"tower_k_" + std::to_string(il), n_kv, mtmd_graph_drama3_gen::n_pos_max, true, GGML_TYPE_F16});
+        slots.push_back({"tower_v_" + std::to_string(il), n_kv, mtmd_graph_drama3_gen::n_pos_max, true, GGML_TYPE_F16});
     }
     for (auto & slot : list_c2w_state_slots(hparams, model)) {
         slots.push_back(slot);
@@ -42,10 +42,23 @@ ggml_tensor * mtmd_graph_drama3_gen::tower_layer(ggml_tensor * x, int il, ggml_t
     ggml_tensor * mixed = ggml_mul_mat(ctx0, tl.eh_proj_w, ggml_concat(ctx0, e, h, 0));
 
     ggml_tensor * cur = ggml_mul(ctx0, ggml_rms_norm(ctx0, mixed, eps), layer.ln_1_w);
-    ggml_tensor * q    = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, layer.q_w, cur), d_head, n_head, n_rows);
-    ggml_tensor * k    = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, layer.k_w, cur), d_head, n_head_kv, n_rows);
-    ggml_tensor * v    = ggml_mul_mat(ctx0, layer.v_w, cur);
-    ggml_tensor * gate = ggml_mul_mat(ctx0, layer.attn_gate_w, cur);
+    ggml_tensor * q    = nullptr;
+    ggml_tensor * k    = nullptr;
+    ggml_tensor * v    = nullptr;
+    ggml_tensor * gate = nullptr;
+    if (n_rows == 1 && tl.qkvg_w != nullptr) {
+        const int64_t n_q = d_head * n_head;
+        ggml_tensor * qkvg = ggml_mul_mat(ctx0, tl.qkvg_w, cur);
+        q    = ggml_reshape_3d(ctx0, ggml_view_1d(ctx0, qkvg, n_q,  0), d_head, n_head, 1);
+        k    = ggml_reshape_3d(ctx0, ggml_view_1d(ctx0, qkvg, n_kv, (size_t) n_q * sizeof(float)), d_head, n_head_kv, 1);
+        v    = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, qkvg, n_kv, (size_t) (n_q + n_kv) * sizeof(float)), n_kv, 1);
+        gate = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, qkvg, n_q,  (size_t) (n_q + 2 * n_kv) * sizeof(float)), n_q, 1);
+    } else {
+        q    = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, layer.q_w, cur), d_head, n_head, n_rows);
+        k    = ggml_reshape_3d(ctx0, ggml_mul_mat(ctx0, layer.k_w, cur), d_head, n_head_kv, n_rows);
+        v    = ggml_mul_mat(ctx0, layer.v_w, cur);
+        gate = ggml_mul_mat(ctx0, layer.attn_gate_w, cur);
+    }
 
     q = ggml_mul(ctx0, ggml_rms_norm(ctx0, q, eps), layer.q_norm);
     k = ggml_mul(ctx0, ggml_rms_norm(ctx0, k, eps), layer.k_norm);
@@ -101,7 +114,7 @@ ggml_cgraph * mtmd_graph_drama3_gen::build_tower() {
         for (const auto & slot : slot_list) {
             ggml_tensor * t = nullptr;
             if (slot.in_place) {
-                t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, slot.ne0, slot.ne1);
+                t = ggml_new_tensor_2d(ctx0, slot.type, slot.ne0, slot.ne1);
                 ggml_set_input(t);
             }
             slots.push_back(t);
@@ -154,7 +167,7 @@ ggml_cgraph * mtmd_graph_drama3_gen::build_tower() {
     extra = ggml_mul(ctx0, ggml_reshape_2d(ctx0, ggml_sum_rows(ctx0, extra), n_embd_cb, n_rows), extra_on);
 
     mtmd_graph_qwen3tts_gen::code_gen cg(*this, top_k, top_p);
-    ggml_tensor * out_codes = emit_out ? cg.cache_set(ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_cb), 0, inp_code0) : nullptr;
+    ggml_tensor * out_codes = emit_out ? inp_code0 : nullptr;
 
     ggml_tensor * code = inp_code0;
     ggml_tensor * x    = h;
@@ -167,7 +180,7 @@ ggml_cgraph * mtmd_graph_drama3_gen::build_tower() {
         if (forced) {
             code = ggml_view_1d(ctx0, inp_force, n_rows, (size_t) ih * inp_force->nb[1]);
             if (emit_out) {
-                out_codes = cg.cache_set(out_codes, ih + 1, code);
+                out_codes = ggml_concat(ctx0, out_codes, code, 0);
             }
             continue;
         }
@@ -179,7 +192,7 @@ ggml_cgraph * mtmd_graph_drama3_gen::build_tower() {
         }
         code = cg.do_sampling(logits, ggml_view_1d(ctx0, inp_rand, 1, (size_t) ih * sizeof(float)));
         if (emit_out) {
-            out_codes = cg.cache_set(out_codes, ih + 1, code);
+            out_codes = ggml_concat(ctx0, out_codes, ggml_reshape_1d(ctx0, code, 1), 0);
         }
     }
 
@@ -188,7 +201,7 @@ ggml_cgraph * mtmd_graph_drama3_gen::build_tower() {
         return gf;
     }
 
-    out_codes = ggml_cont(ctx0, out_codes);
+    out_codes = ggml_reshape_2d(ctx0, out_codes, 1, n_cb);
     ggml_set_name(out_codes, "out_codes");
     ggml_set_output(out_codes);
     ggml_build_forward_expand(gf, out_codes);

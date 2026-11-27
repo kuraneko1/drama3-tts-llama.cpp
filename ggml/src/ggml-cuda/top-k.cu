@@ -374,3 +374,168 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
 #endif                            // CUB_TOP_K_AVAILABLE
 }
+
+template <int BLOCK_SIZE = 256, int MAX_VOCAB = 8192, int MAX_K = 64>
+static __global__ void k_fused_top_k_top_p_sample_f32(
+        const float * __restrict__ logits,
+        const float * __restrict__ rand_ptr,
+        int32_t * __restrict__     dst,
+        const int                  n_vocab,
+        const int                  k,
+        const float                top_p) {
+    constexpr int N_WARPS = BLOCK_SIZE / 32;
+
+    __shared__ float s_val[MAX_VOCAB];
+    __shared__ float s_warp_val[N_WARPS];
+    __shared__ int   s_warp_idx[N_WARPS];
+    __shared__ int   s_win_idx;
+    __shared__ float s_topk_val[MAX_K];
+    __shared__ int   s_topk_idx[MAX_K];
+    __shared__ float s_work[MAX_K];
+    __shared__ float s_keep[MAX_K];
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int n_chunks = (n_vocab + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    uint32_t picked_mask = 0;
+    float    my_best     = -INFINITY;
+    int      my_best_idx = -1;
+
+    for (int m = 0; m < n_chunks; ++m) {
+        const int idx = tid + m * BLOCK_SIZE;
+        if (idx < n_vocab) {
+            const float v = logits[idx];
+            s_val[idx] = v;
+            if (my_best_idx < 0 || v > my_best || (v == my_best && idx < my_best_idx)) {
+                my_best     = v;
+                my_best_idx = idx;
+            }
+        }
+    }
+
+    for (int step = 0; step < k; ++step) {
+        float w_val = my_best;
+        int   w_idx = my_best_idx;
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            const float o_val = __shfl_xor_sync(0xffffffff, w_val, mask);
+            const int   o_idx = __shfl_xor_sync(0xffffffff, w_idx, mask);
+            if (o_idx >= 0 && (w_idx < 0 || o_val > w_val || (o_val == w_val && o_idx < w_idx))) {
+                w_val = o_val;
+                w_idx = o_idx;
+            }
+        }
+        if (lane == 0) {
+            s_warp_val[warp] = w_val;
+            s_warp_idx[warp] = w_idx;
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+            float b_val = (lane < N_WARPS) ? s_warp_val[lane] : -INFINITY;
+            int   b_idx = (lane < N_WARPS) ? s_warp_idx[lane] : -1;
+#pragma unroll
+            for (int mask = N_WARPS / 2; mask > 0; mask >>= 1) {
+                const float o_val = __shfl_xor_sync(0xffffffff, b_val, mask);
+                const int   o_idx = __shfl_xor_sync(0xffffffff, b_idx, mask);
+                if (o_idx >= 0 && (b_idx < 0 || o_val > b_val || (o_val == b_val && o_idx < b_idx))) {
+                    b_val = o_val;
+                    b_idx = o_idx;
+                }
+            }
+            if (lane == 0) {
+                s_win_idx        = b_idx;
+                s_topk_val[step] = b_val;
+                s_topk_idx[step] = b_idx;
+            }
+        }
+        __syncthreads();
+
+        const int win_idx = s_win_idx;
+        if (win_idx >= 0 && (win_idx % BLOCK_SIZE) == tid) {
+            picked_mask |= (1u << (win_idx / BLOCK_SIZE));
+            my_best     = -INFINITY;
+            my_best_idx = -1;
+            for (int m = 0; m < n_chunks; ++m) {
+                if ((picked_mask & (1u << m)) == 0) {
+                    const int idx = tid + m * BLOCK_SIZE;
+                    if (idx < n_vocab) {
+                        const float v = s_val[idx];
+                        if (my_best_idx < 0 || v > my_best || (v == my_best && idx < my_best_idx)) {
+                            my_best     = v;
+                            my_best_idx = idx;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (tid == 0) {
+        const float max_v1 = s_topk_val[0];
+        float sum_e1 = 0.0f;
+        for (int j = 0; j < k; ++j) {
+            const float e = expf(s_topk_val[j] - max_v1);
+            s_work[j] = e;
+            sum_e1 += e;
+        }
+        const float inv_s1 = 1.0f / sum_e1;
+        float cdf1     = 0.0f;
+        float sum_keep = 0.0f;
+        for (int j = 0; j < k; ++j) {
+            cdf1 += s_work[j] * inv_s1;
+            const float km = (top_p - cdf1 > 0.0f) ? 1.0f : 0.0f;
+            s_keep[j]  = km;
+            sum_keep  += km;
+        }
+        const int force_idx = (int) fminf(fmaxf(sum_keep, 0.0f), (float) (k - 1));
+        s_keep[force_idx] = 1.0f;
+
+        float max_v2 = -INFINITY;
+        for (int j = 0; j < k; ++j) {
+            if (s_keep[j] > 0.0f && s_topk_val[j] > max_v2) {
+                max_v2 = s_topk_val[j];
+            }
+        }
+        float sum_e2 = 0.0f;
+        for (int j = 0; j < k; ++j) {
+            const float e = (s_keep[j] > 0.0f) ? expf(s_topk_val[j] - max_v2) : 0.0f;
+            s_work[j] = e;
+            sum_e2 += e;
+        }
+        const float inv_s2 = 1.0f / sum_e2;
+        const float r = *rand_ptr;
+        float cdf2      = 0.0f;
+        float sum_cross = 0.0f;
+        for (int j = 0; j < k; ++j) {
+            cdf2 += s_work[j] * inv_s2;
+            sum_cross += (cdf2 - r > 0.0f) ? 1.0f : 0.0f;
+        }
+        const int draw_pos = (int) fminf(fmaxf((float) k - sum_cross, 0.0f), (float) (k - 1));
+        *dst = s_topk_idx[draw_pos];
+    }
+}
+
+void ggml_cuda_op_top_k_top_p_sample_fused(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor *         logits,
+        const ggml_tensor *         rand_val,
+        ggml_tensor *               dst,
+        const int                   k,
+        const float                 top_p) {
+    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ggml_is_contiguous(logits));
+    GGML_ASSERT(rand_val->type == GGML_TYPE_F32 && ggml_is_contiguous(rand_val));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_nelements(dst) == 1);
+    const int n_vocab = (int) logits->ne[0];
+    GGML_ASSERT(n_vocab > k && n_vocab <= 8192 && k >= 1 && k <= 64);
+
+    k_fused_top_k_top_p_sample_f32<256, 8192, 64><<<1, 256, 0, ctx.stream()>>>(
+        (const float *) logits->data,
+        (const float *) rand_val->data,
+        (int32_t *)     dst->data,
+        n_vocab,
+        k,
+        top_p);
+}

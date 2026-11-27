@@ -674,6 +674,9 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_down_inject  = nullptr; // [hc_ffn_down | hc_ffn_inject] in one weight
     struct ggml_tensor * wqkv_z              = nullptr; // [wqkv | wqkv_gate] in one weight
     struct ggml_tensor * ssm_beta_alpha_cat  = nullptr; // [ssm_beta | ssm_alpha] in one weight, unlike the grouped ssm_beta_alpha
+    struct ggml_tensor * ffn_gate_inp_all    = nullptr; // [ffn_gate_inp | ffn_gate_inp_shexp] in one F32 weight
+    struct ggml_tensor * wqkv_gate_ab        = nullptr; // [wqkv_gate | ssm_alpha | ssm_beta] in one weight
+    struct ggml_tensor * wqk                 = nullptr; // [wq | wk] in one weight
 
     struct ggml_tensor * ple_key        = nullptr;
     struct ggml_tensor * ple_value      = nullptr;
@@ -1170,6 +1173,7 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+    void load_tensors_qwen35moe_merged();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

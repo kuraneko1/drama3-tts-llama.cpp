@@ -1127,6 +1127,10 @@ extern "C" {
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
 
+    // Restrict logits output (when supported by the model graph) to [start, start + count) rows.
+    // Pass count <= 0 to emit full vocabulary logits (default).
+    LLAMA_API void llama_set_output_vocab_range(struct llama_context * ctx, int32_t start, int32_t count);
+
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);

@@ -91,6 +91,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
 
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
+    MMVQ_PARAMETERS_VOLTA,
     MMVQ_PARAMETERS_TURING,
     MMVQ_PARAMETERS_GCN,
     MMVQ_PARAMETERS_RDNA1,
@@ -112,7 +113,9 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_RDNA2;
 #elif defined(GCN) || defined(CDNA)
     return MMVQ_PARAMETERS_GCN;
-#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
+#elif __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+    return MMVQ_PARAMETERS_VOLTA;
+#elif __CUDA_ARCH__ > GGML_CUDA_CC_VOLTA && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
     return MMVQ_PARAMETERS_TURING;
 #elif __CUDA_ARCH__ == GGML_CUDA_CC_GB10
     return MMVQ_PARAMETERS_GB10;
@@ -139,7 +142,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     if (GGML_CUDA_CC_IS_GCN(cc) || GGML_CUDA_CC_IS_CDNA(cc)) {
         return MMVQ_PARAMETERS_GCN;
     }
-    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_VOLTA) {
+        return MMVQ_PARAMETERS_VOLTA;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) > GGML_CUDA_CC_VOLTA && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_GB10) {
@@ -572,6 +578,33 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 return 1;
         }
     }
+    if (table_id == MMVQ_PARAMETERS_VOLTA) {
+        if (ncols_dst == 1) {
+            switch (type) {
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q3_K:
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_Q5_K:
+                case GGML_TYPE_Q6_K:
+                    return 2;
+                default:
+                    return 4;
+            }
+        }
+        switch (ncols_dst) {
+            case 2:
+            case 3:
+            case 4:
+                return 4;
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 2;
+            default:
+                return 1;
+        }
+    }
     if (table_id == MMVQ_PARAMETERS_TURING) {
         if (ncols_dst == 1) {
             switch (type) {
@@ -641,6 +674,28 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+    if (table_id == MMVQ_PARAMETERS_VOLTA) {
+        switch (ncols_dst) {
+            case 1:
+                if (small_k) {
+                    return nwarps;
+                }
+                if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) {
+                    return 2;
+                }
+                return 1;
+            case 2:
+            case 3:
+            case 4:
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 2;
+            default:
+                return 1;
+        }
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 || table_id == MMVQ_PARAMETERS_RDNA1) {
         switch (ncols_dst) {
             case 1:
@@ -1631,12 +1686,47 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    const size_t q8_1_bytes   = (size_t) ne13 * ne12 * ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1;
+    const size_t aligned_bytes = (q8_1_bytes + 255) & ~size_t(255);
+    ggml_cuda_pool_alloc<char> src1_q8_1_fallback(ctx.pool());
+    const char * src1_q8_1_ptr = nullptr;
     {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1->data, src1->type, src1_q8_1.get(), ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        const int64_t s11_in = src1->nb[1] / ts_src1;
+        const int64_t s12_in = src1->nb[2] / ts_src1;
+        const int64_t s13_in = src1->nb[3] / ts_src1;
+        bool cache_hit = false;
+        const bool can_cache = (ctx.curr_stream_no == 0 && q8_1_bytes <= 256 * 1024 && ctx.q8_1_cache_buf != nullptr);
+        if (can_cache) {
+            for (const auto & e : ctx.q8_1_cache) {
+                if (e.src_data == src1->data && e.src_type == src1->type &&
+                        e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
+                        e.s11 == s11_in && e.s12 == s12_in && e.s13 == s13_in) {
+                    src1_q8_1_ptr = e.q8_1_ptr;
+                    cache_hit = true;
+                    break;
+                }
+            }
+        }
+        if (!cache_hit) {
+            char * dst_q8 = nullptr;
+            if (can_cache && ctx.q8_1_cache_used + aligned_bytes <= ctx.q8_1_cache_cap) {
+                dst_q8 = (char *) ctx.q8_1_cache_buf + ctx.q8_1_cache_used;
+                ctx.q8_1_cache_used += aligned_bytes;
+                const size_t src_span = std::max(ggml_nbytes(src1),
+                    ggml_row_size(src1->type, src1->ne[0]) +
+                    (size_t) std::max<int64_t>(0, src1->ne[1] - 1) * src1->nb[1] +
+                    (size_t) std::max<int64_t>(0, src1->ne[2] - 1) * src1->nb[2] +
+                    (size_t) std::max<int64_t>(0, src1->ne[3] - 1) * src1->nb[3]);
+                ctx.q8_1_cache.push_back({
+                    src1->data, src_span, src1->type,
+                    ne10, ne11, ne12, ne13, s11_in, s12_in, s13_in, dst_q8
+                });
+            } else {
+                dst_q8 = src1_q8_1_fallback.alloc(q8_1_bytes);
+            }
+            quantize_row_q8_1_cuda(src1->data, src1->type, dst_q8, ne10, s11_in, s12_in, s13_in, ne10_padded, ne11, ne12, ne13, stream);
+            src1_q8_1_ptr = dst_q8;
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1662,7 +1752,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
