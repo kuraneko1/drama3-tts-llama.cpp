@@ -17,6 +17,19 @@
 
 </div>
 
+## Drama-3-Japanese TTS Optimization (Volta `sm_70` / Tesla PG500-216)
+
+100% lossless kernel fusions, memory-layout alignments (`planar q8_1`), GDN `float4` vectorization, 23/23-layer `Q/K/V` prep mega-fusion, and 1-pass `sigmoid(gate)`-fused FlashAttention (`D=256, GQA=8`) on `Drama-3-Japanese.Q4_K_M` (`3,702.24 MB/frame` active weight + GDN recurrent state traffic).
+
+![Drama-3-Japanese TTS Volta sm_70 Optimization History](docs/drama3-sm70-optimization.png)
+
+| Stage | End-to-End `t1` (`--seed 42`) | Decode GPU Compute (`nvprof`) | Effective GPU Bandwidth | Decode Kernels / Frame |
+|---|---:|---:|---:|---:|
+| Baseline (`5ebe9e9`) | `85.0 fps` (`11.76 ms/f`) | `10.922 ms/f` | `339.0 GB/s` | `1,451` |
+| Iter 5b (`81342b3`) | `117.5 fps` (`8.51 ms/f`) | `7.999 ms/f` | `462.8 GB/s` | `833` |
+| **Iter 9b (`3478058`)** | **`122.0 fps` (`8.19 ms/f`)** | **`7.099 ms/f`** | **`521.5 GB/s`** | **`676`** |
+| **Iter 9b (512f Steady-State)** | **`127.4 fps` (`7.85 ms/f`)** | — | `471.6 GB/s` *(Wall)* | — |
+
 ## Description
 
 The main goal of `llama.cpp` is to enable LLM (and MLLM) inference with minimal setup and state-of-the-art performance on a wide range of hardware - locally and in the cloud.
