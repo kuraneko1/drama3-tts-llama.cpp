@@ -18,6 +18,10 @@ struct gdn_replay_args {
     int             n_pend;
     bool            keep;  // write the state after the replay, not the final one
 
+    // optional: indirect state gather from cache table (fused GET_ROWS)
+    const int32_t * state_ids;
+    int64_t         state_in_row_stride;
+
     // optional: store the k, v, g, beta inputs of the new tokens (fused cpys)
     float *         st[4];
     int64_t         st2[4]; // token stride in floats
@@ -75,7 +79,9 @@ gated_delta_net_cuda(const float * q,
 
     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
-    const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+    const int64_t seq_in               = (rep.state_ids != nullptr) ? (int64_t) rep.state_ids[sequence] : sequence;
+    const int64_t state_seq_stride     = (rep.state_ids != nullptr) ? rep.state_in_row_stride : H * S_v * S_v;
+    const int64_t state_in_offset      = seq_in * state_seq_stride + h_idx * S_v * S_v;
     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
     state += state_out_offset;
     curr_state += state_in_offset + col * S_v;
@@ -451,6 +457,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const ggml_tensor * src_pend  = dst->src[6];
 
     gdn_replay_args rep = {};
+    if (cache != nullptr && cache->state_in_ptr != nullptr) {
+        s_d                     = cache->state_in_ptr;
+        rep.state_ids           = cache->state_ids;
+        rep.state_in_row_stride = cache->state_in_row_stride;
+    }
     if (src_pend) {
         const ggml_tensor * src_pv  = dst->src[7];
         const ggml_tensor * src_pgb = dst->src[8];
@@ -486,7 +497,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
         sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, REP, stream)
 #define GDN_LAUNCH(KDA, KEEP, REPLAY) GDN_LAUNCH_N(KDA, KEEP, REPLAY, n_tokens, rep)
 
-    if (!src_pend) {
+    if (!src_pend && rep.state_ids == nullptr) {
         ggml_cuda_gdn_mma_args args = ggml_cuda_gdn_mma_args_from_tensor(dst);
         args.state_out = state_d;
         if (ggml_cuda_gdn_mma_launch(ctx.device, args, stream)) {

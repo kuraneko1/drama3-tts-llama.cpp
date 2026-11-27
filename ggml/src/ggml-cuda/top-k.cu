@@ -375,7 +375,11 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #endif                            // CUB_TOP_K_AVAILABLE
 }
 
-template <int BLOCK_SIZE = 256, int MAX_VOCAB = 8192, int MAX_K = 64>
+__device__ __forceinline__ bool topk_cand_better(float va, int ia, float vb, int ib) {
+    return (ib < 0) || (ia >= 0 && (va > vb || (va == vb && ia < ib)));
+}
+
+template <int BLOCK_SIZE = 256, int MAX_CHUNKS = 16, int MAX_K = 64>
 static __global__ void k_fused_top_k_top_p_sample_f32(
         const float * __restrict__ logits,
         const float * __restrict__ rand_ptr,
@@ -385,99 +389,300 @@ static __global__ void k_fused_top_k_top_p_sample_f32(
         const float                top_p) {
     constexpr int N_WARPS = BLOCK_SIZE / 32;
 
-    __shared__ float s_val[MAX_VOCAB];
+    __shared__ float s_tmax[BLOCK_SIZE];
+    __shared__ float s_cval[BLOCK_SIZE];
+    __shared__ int   s_cidx[BLOCK_SIZE];
+    __shared__ int   s_warp_cnt[N_WARPS];
+    __shared__ int   s_warp_off[N_WARPS];
     __shared__ float s_warp_val[N_WARPS];
     __shared__ int   s_warp_idx[N_WARPS];
     __shared__ int   s_win_idx;
-    __shared__ float s_topk_val[MAX_K];
-    __shared__ int   s_topk_idx[MAX_K];
     __shared__ float s_work[MAX_K];
     __shared__ float s_keep[MAX_K];
 
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int n_chunks = (n_vocab + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    uint32_t picked_mask = 0;
-    float    my_best     = -INFINITY;
-    int      my_best_idx = -1;
-
-    for (int m = 0; m < n_chunks; ++m) {
+    float r_val[MAX_CHUNKS];
+    float my_max = -INFINITY;
+#pragma unroll
+    for (int m = 0; m < MAX_CHUNKS; ++m) {
         const int idx = tid + m * BLOCK_SIZE;
-        if (idx < n_vocab) {
-            const float v = logits[idx];
-            s_val[idx] = v;
-            if (my_best_idx < 0 || v > my_best || (v == my_best && idx < my_best_idx)) {
-                my_best     = v;
-                my_best_idx = idx;
-            }
+        const float v = (idx < n_vocab) ? logits[idx] : -INFINITY;
+        r_val[m] = v;
+        if (idx < n_vocab && v > my_max) {
+            my_max = v;
         }
     }
 
-    for (int step = 0; step < k; ++step) {
-        float w_val = my_best;
-        int   w_idx = my_best_idx;
-#pragma unroll
-        for (int mask = 16; mask > 0; mask >>= 1) {
-            const float o_val = __shfl_xor_sync(0xffffffff, w_val, mask);
-            const int   o_idx = __shfl_xor_sync(0xffffffff, w_idx, mask);
-            if (o_idx >= 0 && (w_idx < 0 || o_val > w_val || (o_val == w_val && o_idx < w_idx))) {
-                w_val = o_val;
-                w_idx = o_idx;
+    // Step 1: exact lower bound t_lb = k-th largest thread maximum via descending bitonic sort
+    s_tmax[tid] = my_max;
+    for (int size = 2; size <= BLOCK_SIZE; size <<= 1) {
+        const bool inter_warp = (size >= 64);
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            if (inter_warp && stride >= 16) {
+                __syncthreads();
+            } else {
+                __syncwarp();
             }
-        }
-        if (lane == 0) {
-            s_warp_val[warp] = w_val;
-            s_warp_idx[warp] = w_idx;
-        }
-        __syncthreads();
-
-        if (warp == 0) {
-            float b_val = (lane < N_WARPS) ? s_warp_val[lane] : -INFINITY;
-            int   b_idx = (lane < N_WARPS) ? s_warp_idx[lane] : -1;
-#pragma unroll
-            for (int mask = N_WARPS / 2; mask > 0; mask >>= 1) {
-                const float o_val = __shfl_xor_sync(0xffffffff, b_val, mask);
-                const int   o_idx = __shfl_xor_sync(0xffffffff, b_idx, mask);
-                if (o_idx >= 0 && (b_idx < 0 || o_val > b_val || (o_val == b_val && o_idx < b_idx))) {
-                    b_val = o_val;
-                    b_idx = o_idx;
+            const int ixj = tid ^ stride;
+            if (ixj > tid) {
+                const float a = s_tmax[tid];
+                const float b = s_tmax[ixj];
+                const bool want_desc = (tid & size) == 0;
+                if (want_desc ? (a < b) : (a > b)) {
+                    s_tmax[tid] = b;
+                    s_tmax[ixj] = a;
                 }
             }
-            if (lane == 0) {
-                s_win_idx        = b_idx;
-                s_topk_val[step] = b_val;
-                s_topk_idx[step] = b_idx;
+        }
+    }
+    __syncthreads();
+    const float t_lb = s_tmax[k - 1];
+
+    // Step 2: lock-free candidate count and prefix sum for r_val[m] >= t_lb
+    int my_cnt = 0;
+#pragma unroll
+    for (int m = 0; m < MAX_CHUNKS; ++m) {
+        const int idx = tid + m * BLOCK_SIZE;
+        if (idx < n_vocab && r_val[m] >= t_lb) {
+            my_cnt++;
+        }
+    }
+
+    int warp_sum = my_cnt;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const int n = __shfl_up_sync(0xffffffff, warp_sum, d);
+        if (lane >= d) {
+            warp_sum += n;
+        }
+    }
+    if (lane == 31) {
+        s_warp_cnt[warp] = warp_sum;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        int wc = (lane < N_WARPS) ? s_warp_cnt[lane] : 0;
+#pragma unroll
+        for (int d = 1; d < N_WARPS; d <<= 1) {
+            const int n = __shfl_up_sync(0xffffffff, wc, d);
+            if (lane >= d) {
+                wc += n;
             }
+        }
+        if (lane < N_WARPS) {
+            s_warp_off[lane] = wc;
+        }
+    }
+    __syncthreads();
+
+    const int total_cand = s_warp_off[N_WARPS - 1];
+    const int warp_base  = (warp == 0) ? 0 : s_warp_off[warp - 1];
+    int       my_off     = warp_base + (warp_sum - my_cnt);
+
+    if (total_cand <= BLOCK_SIZE) {
+        // Step 3A (fast path): gather <= 256 candidates and descending bitonic sort
+        const int need = max(total_cand, k);
+        const int P    = (need <= 1) ? 1 : (1 << (32 - __clz((unsigned) (need - 1))));
+        if (tid < P) {
+            s_cval[tid] = -INFINITY;
+            s_cidx[tid] = -1;
         }
         __syncthreads();
 
-        const int win_idx = s_win_idx;
-        if (win_idx >= 0 && (win_idx % BLOCK_SIZE) == tid) {
-            picked_mask |= (1u << (win_idx / BLOCK_SIZE));
-            my_best     = -INFINITY;
-            my_best_idx = -1;
-            for (int m = 0; m < n_chunks; ++m) {
-                if ((picked_mask & (1u << m)) == 0) {
-                    const int idx = tid + m * BLOCK_SIZE;
-                    if (idx < n_vocab) {
-                        const float v = s_val[idx];
-                        if (my_best_idx < 0 || v > my_best || (v == my_best && idx < my_best_idx)) {
-                            my_best     = v;
-                            my_best_idx = idx;
+#pragma unroll
+        for (int m = 0; m < MAX_CHUNKS; ++m) {
+            const int idx = tid + m * BLOCK_SIZE;
+            if (idx < n_vocab && r_val[m] >= t_lb) {
+                s_cval[my_off] = r_val[m];
+                s_cidx[my_off] = idx;
+                my_off++;
+            }
+        }
+
+        for (int size = 2; size <= P; size <<= 1) {
+            const bool inter_warp = (size >= 64);
+            for (int stride = size >> 1; stride > 0; stride >>= 1) {
+                if (inter_warp && stride >= 16) {
+                    __syncthreads();
+                } else {
+                    __syncwarp();
+                }
+                if (tid < P) {
+                    const int ixj = tid ^ stride;
+                    if (ixj > tid) {
+                        const float va = s_cval[tid];
+                        const int   ia = s_cidx[tid];
+                        const float vb = s_cval[ixj];
+                        const int   ib = s_cidx[ixj];
+                        const bool want_desc = (tid & size) == 0;
+                        const bool swap = want_desc ? !topk_cand_better(va, ia, vb, ib)
+                                                    :  topk_cand_better(va, ia, vb, ib);
+                        if (swap) {
+                            s_cval[tid] = vb;
+                            s_cidx[tid] = ib;
+                            s_cval[ixj] = va;
+                            s_cidx[ixj] = ia;
                         }
                     }
                 }
             }
         }
+        __syncthreads();
+    } else {
+        // Step 3B (rare fallback when > 256 candidates tied/clustered >= t_lb): exact register argmax
+        uint32_t picked_mask = 0;
+        float    my_best     = -INFINITY;
+        int      my_best_idx = -1;
+#pragma unroll
+        for (int m = 0; m < MAX_CHUNKS; ++m) {
+            const int idx = tid + m * BLOCK_SIZE;
+            if (idx < n_vocab) {
+                const float v = r_val[m];
+                if (my_best_idx < 0 || v > my_best || (v == my_best && idx < my_best_idx)) {
+                    my_best     = v;
+                    my_best_idx = idx;
+                }
+            }
+        }
+
+        for (int step = 0; step < k; ++step) {
+            float w_val = my_best;
+            int   w_idx = my_best_idx;
+#pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                const float o_val = __shfl_xor_sync(0xffffffff, w_val, mask);
+                const int   o_idx = __shfl_xor_sync(0xffffffff, w_idx, mask);
+                if (o_idx >= 0 && (w_idx < 0 || o_val > w_val || (o_val == w_val && o_idx < w_idx))) {
+                    w_val = o_val;
+                    w_idx = o_idx;
+                }
+            }
+            if (lane == 0) {
+                s_warp_val[warp] = w_val;
+                s_warp_idx[warp] = w_idx;
+            }
+            __syncthreads();
+
+            if (warp == 0) {
+                float b_val = (lane < N_WARPS) ? s_warp_val[lane] : -INFINITY;
+                int   b_idx = (lane < N_WARPS) ? s_warp_idx[lane] : -1;
+#pragma unroll
+                for (int mask = N_WARPS / 2; mask > 0; mask >>= 1) {
+                    const float o_val = __shfl_xor_sync(0xffffffff, b_val, mask);
+                    const int   o_idx = __shfl_xor_sync(0xffffffff, b_idx, mask);
+                    if (o_idx >= 0 && (b_idx < 0 || o_val > b_val || (o_val == b_val && o_idx < b_idx))) {
+                        b_val = o_val;
+                        b_idx = o_idx;
+                    }
+                }
+                if (lane == 0) {
+                    s_win_idx    = b_idx;
+                    s_cval[step] = b_val;
+                    s_cidx[step] = b_idx;
+                }
+            }
+            __syncthreads();
+
+            const int win_idx = s_win_idx;
+            if (win_idx >= 0 && (win_idx % BLOCK_SIZE) == tid) {
+                picked_mask |= (1u << (win_idx / BLOCK_SIZE));
+                my_best     = -INFINITY;
+                my_best_idx = -1;
+#pragma unroll
+                for (int m = 0; m < MAX_CHUNKS; ++m) {
+                    if ((picked_mask & (1u << m)) == 0) {
+                        const int idx = tid + m * BLOCK_SIZE;
+                        if (idx < n_vocab) {
+                            const float v = r_val[m];
+                            if (my_best_idx < 0 || v > my_best || (v == my_best && idx < my_best_idx)) {
+                                my_best     = v;
+                                my_best_idx = idx;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
     }
 
-    if (tid == 0) {
-        const float max_v1 = s_topk_val[0];
+    if (k <= 32) {
+        if (warp == 0) {
+            const bool active = lane < k;
+            const float val   = active ? s_cval[lane] : -INFINITY;
+            const float max_v1 = s_cval[0];
+            const float e1     = active ? expf(val - max_v1) : 0.0f;
+
+            float sum_e1 = e1;
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                sum_e1 += __shfl_xor_sync(0xffffffff, sum_e1, m);
+            }
+            const float p1 = e1 / sum_e1;
+
+            float cdf1 = p1;
+#pragma unroll
+            for (int d = 1; d < 32; d <<= 1) {
+                const float n = __shfl_up_sync(0xffffffff, cdf1, d);
+                if (lane >= d) {
+                    cdf1 += n;
+                }
+            }
+
+            int keep = (active && (top_p - cdf1 > 0.0f)) ? 1 : 0;
+            int sum_keep = keep;
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                sum_keep += __shfl_xor_sync(0xffffffff, sum_keep, m);
+            }
+            const int force_idx = min(max(sum_keep, 0), k - 1);
+            if (lane == force_idx) {
+                keep = 1;
+            }
+
+            float max_v2 = keep ? val : -INFINITY;
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                max_v2 = fmaxf(max_v2, __shfl_xor_sync(0xffffffff, max_v2, m));
+            }
+
+            const float e2 = keep ? expf(val - max_v2) : 0.0f;
+            float sum_e2 = e2;
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                sum_e2 += __shfl_xor_sync(0xffffffff, sum_e2, m);
+            }
+            const float p2 = e2 / sum_e2;
+
+            float cdf2 = p2;
+#pragma unroll
+            for (int d = 1; d < 32; d <<= 1) {
+                const float n = __shfl_up_sync(0xffffffff, cdf2, d);
+                if (lane >= d) {
+                    cdf2 += n;
+                }
+            }
+
+            const float r = *rand_ptr;
+            int cross = (active && (cdf2 - r > 0.0f)) ? 1 : 0;
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) {
+                cross += __shfl_xor_sync(0xffffffff, cross, m);
+            }
+            const int draw_pos = min(max(k - cross, 0), k - 1);
+            if (lane == 0) {
+                *dst = s_cidx[draw_pos];
+            }
+        }
+    } else if (tid == 0) {
+        const float max_v1 = s_cval[0];
         float sum_e1 = 0.0f;
         for (int j = 0; j < k; ++j) {
-            const float e = expf(s_topk_val[j] - max_v1);
+            const float e = expf(s_cval[j] - max_v1);
             s_work[j] = e;
             sum_e1 += e;
         }
@@ -495,13 +700,13 @@ static __global__ void k_fused_top_k_top_p_sample_f32(
 
         float max_v2 = -INFINITY;
         for (int j = 0; j < k; ++j) {
-            if (s_keep[j] > 0.0f && s_topk_val[j] > max_v2) {
-                max_v2 = s_topk_val[j];
+            if (s_keep[j] > 0.0f && s_cval[j] > max_v2) {
+                max_v2 = s_cval[j];
             }
         }
         float sum_e2 = 0.0f;
         for (int j = 0; j < k; ++j) {
-            const float e = (s_keep[j] > 0.0f) ? expf(s_topk_val[j] - max_v2) : 0.0f;
+            const float e = (s_keep[j] > 0.0f) ? expf(s_cval[j] - max_v2) : 0.0f;
             s_work[j] = e;
             sum_e2 += e;
         }
@@ -514,7 +719,7 @@ static __global__ void k_fused_top_k_top_p_sample_f32(
             sum_cross += (cdf2 - r > 0.0f) ? 1.0f : 0.0f;
         }
         const int draw_pos = (int) fminf(fmaxf((float) k - sum_cross, 0.0f), (float) (k - 1));
-        *dst = s_topk_idx[draw_pos];
+        *dst = s_cidx[draw_pos];
     }
 }
 
@@ -531,11 +736,21 @@ void ggml_cuda_op_top_k_top_p_sample_fused(
     const int n_vocab = (int) logits->ne[0];
     GGML_ASSERT(n_vocab > k && n_vocab <= 8192 && k >= 1 && k <= 64);
 
-    k_fused_top_k_top_p_sample_f32<256, 8192, 64><<<1, 256, 0, ctx.stream()>>>(
-        (const float *) logits->data,
-        (const float *) rand_val->data,
-        (int32_t *)     dst->data,
-        n_vocab,
-        k,
-        top_p);
+    if (n_vocab <= 4096) {
+        k_fused_top_k_top_p_sample_f32<256, 16, 64><<<1, 256, 0, ctx.stream()>>>(
+            (const float *) logits->data,
+            (const float *) rand_val->data,
+            (int32_t *)     dst->data,
+            n_vocab,
+            k,
+            top_p);
+    } else {
+        k_fused_top_k_top_p_sample_f32<256, 32, 64><<<1, 256, 0, ctx.stream()>>>(
+            (const float *) logits->data,
+            (const float *) rand_val->data,
+            (int32_t *)     dst->data,
+            n_vocab,
+            k,
+            top_p);
+    }
 }

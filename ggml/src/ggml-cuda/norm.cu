@@ -841,7 +841,86 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
-void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template <int block_size>
+static __global__ void rms_norm_mul_2048_f32_noq8(
+        const float * __restrict__ x,
+        const float * __restrict__ mul,
+        float * __restrict__       dst,
+        const float                eps) {
+    const int tid = threadIdx.x;
+    __shared__ float s_sum[32];
+
+    const float4 x4 = reinterpret_cast<const float4 *>(x)[tid];
+    const float4 m4 = reinterpret_cast<const float4 *>(mul)[tid];
+
+    float tmp = x4.x * x4.x + x4.y * x4.y + x4.z * x4.z + x4.w * x4.w;
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / 2048.0f + eps);
+
+    reinterpret_cast<float4 *>(dst)[tid] = make_float4(
+        scale * x4.x * m4.x,
+        scale * x4.y * m4.y,
+        scale * x4.z * m4.z,
+        scale * x4.w * m4.w);
+}
+
+template <int block_size>
+static __global__ void rms_norm_mul_q8_1_2048_f32(
+        const float * __restrict__ x,
+        const float * __restrict__ mul,
+        float * __restrict__       dst,
+        block_q8_1 * __restrict__  q8,
+        const float                eps) {
+    const int tid   = threadIdx.x;
+    const int lane8 = tid & 7;
+    const int blk   = tid >> 3;
+
+    __shared__ float s_sum[32];
+
+    const float4 x4 = ((const float4 *) x)[tid];
+    const float4 m4 = ((const float4 *) mul)[tid];
+
+    float tmp = x4.x * x4.x + x4.y * x4.y + x4.z * x4.z + x4.w * x4.w;
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / 2048.0f + eps);
+
+    const float4 r = make_float4(
+        scale * x4.x * m4.x,
+        scale * x4.y * m4.y,
+        scale * x4.z * m4.z,
+        scale * x4.w * m4.w);
+    ((float4 *) dst)[tid] = r;
+
+    float amax = fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w)));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 4));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1));
+
+    const float d  = amax / 127.0f;
+    const int   q0 = (amax == 0.0f) ? 0 : (int) roundf(r.x / d);
+    const int   q1 = (amax == 0.0f) ? 0 : (int) roundf(r.y / d);
+    const int   q2 = (amax == 0.0f) ? 0 : (int) roundf(r.z / d);
+    const int   q3 = (amax == 0.0f) ? 0 : (int) roundf(r.w / d);
+
+    const uint32_t packed =
+        ((uint32_t) (uint8_t) (int8_t) q0) |
+        (((uint32_t) (uint8_t) (int8_t) q1) << 8) |
+        (((uint32_t) (uint8_t) (int8_t) q2) << 16) |
+        (((uint32_t) (uint8_t) (int8_t) q3) << 24);
+    ((uint32_t *) q8[blk].qs)[lane8] = packed;
+
+    int sum_q = q0 + q1 + q2 + q3;
+    sum_q += __shfl_xor_sync(0xffffffff, sum_q, 4);
+    sum_q += __shfl_xor_sync(0xffffffff, sum_q, 2);
+    sum_q += __shfl_xor_sync(0xffffffff, sum_q, 1);
+    if (lane8 == 0) {
+        q8[blk].ds = make_half2(d, d * sum_q);
+    }
+}
+#endif
+
+void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor, bool write_q8_1) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
@@ -886,6 +965,44 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nrows     = mul_src->ne[1];
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (rms_norm_src->type == GGML_TYPE_F32 && mul_tensor->type == GGML_TYPE_F32 &&
+            ne00 == 2048 && ne01 == 1 && ne02 == 1 && ne03 == 1 &&
+            mul_ncols == 2048 && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 &&
+            ggml_is_contiguous(rms_norm_src) && ggml_is_contiguous(mul_src) && ggml_is_contiguous(mul_tensor) &&
+            ((uintptr_t) rms_norm_src->data & 15) == 0 && ((uintptr_t) mul_src->data & 15) == 0 && ((uintptr_t) mul_tensor->data & 15) == 0) {
+        if (!write_q8_1) {
+            rms_norm_mul_2048_f32_noq8<512><<<1, 512, 0, stream>>>(
+                (const float *) rms_norm_src->data,
+                (const float *) mul_src->data,
+                (float *)       mul_tensor->data,
+                eps);
+            return;
+        }
+        if (ctx.curr_stream_no == 0 && ctx.q8_1_cache_buf != nullptr) {
+        constexpr int64_t ne10_padded = GGML_PAD(2048, MATRIX_ROW_PADDING);
+        constexpr size_t  q8_1_bytes  = (size_t) ne10_padded * sizeof(block_q8_1) / QK8_1;
+        constexpr size_t  aligned_b   = (q8_1_bytes + 255) & ~size_t(255);
+        if (ctx.q8_1_cache_used + aligned_b <= ctx.q8_1_cache_cap) {
+            ctx.q8_1_cache_invalidate_range(mul_tensor->data, ggml_nbytes(mul_tensor));
+            char * dst_q8 = (char *) ctx.q8_1_cache_buf + ctx.q8_1_cache_used;
+            ctx.q8_1_cache_used += aligned_b;
+            ctx.q8_1_cache.push_back({
+                mul_tensor->data, ggml_nbytes(mul_tensor), GGML_TYPE_F32,
+                2048, 1, 1, 1, 2048, 2048, 2048, dst_q8
+            });
+            rms_norm_mul_q8_1_2048_f32<512><<<1, 512, 0, stream>>>(
+                (const float *) rms_norm_src->data,
+                (const float *) mul_src->data,
+                (float *)       mul_tensor->data,
+                (block_q8_1 *)  dst_q8,
+                eps);
+            return;
+        }
+        }
+    }
+#endif
 
     rms_norm_launch_typed(mul_tensor, [&](auto * dst_d) {
         rms_norm_mul_f32_cuda(rms_norm_src, mul_src, nullptr, dst_d,
@@ -1031,4 +1148,181 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void rms_norm_mul_silu_q8_1_128_f32(
+        const float * __restrict__ x,
+        const float * __restrict__ w,
+        const float * __restrict__ z,
+        float * __restrict__       dst,
+        block_q8_1 * __restrict__  q8,
+        const float                eps) {
+    const int head = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int idx  = head * 128 + tid;
+
+    __shared__ float s_sum[4];
+
+    const float xi = x[idx];
+    const float wi = w[tid];
+    const float zi = z[idx];
+
+    float sq = xi * xi;
+    sq = block_reduce<block_reduce_method::SUM, 128>(sq, s_sum);
+    const float scale = rsqrtf(sq / 128.0f + eps);
+
+    const float normed = xi * scale * wi;
+    const float gated  = zi / (1.0f + expf(-zi));
+    const float val    = normed * gated;
+    dst[idx] = val;
+
+    if (q8 != nullptr) {
+        const int lane = tid & 31;
+        const int blk  = head * 4 + (tid >> 5);
+        const float amax = warp_reduce_max<32>(fabsf(val));
+        const float d    = amax / 127.0f;
+        const int   q    = (amax == 0.0f) ? 0 : (int) roundf(val / d);
+        q8[blk].qs[lane] = (int8_t) q;
+        const int sum_q  = warp_reduce_sum<32>(q);
+        if (lane == 0) {
+            q8[blk].ds = make_half2(d, d * sum_q);
+        }
+    }
+}
+#endif
+
+void ggml_cuda_op_rms_norm_mul_silu_fused(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * rms_node,
+        ggml_tensor * norm_mul_node,
+        ggml_tensor * silu_node,
+        ggml_tensor * out_mul_node) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const ggml_tensor * x = rms_node->src[0];
+    const ggml_tensor * w = (norm_mul_node->src[0] == rms_node) ? norm_mul_node->src[1] : norm_mul_node->src[0];
+    const ggml_tensor * z = silu_node->src[0];
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_node->op_params, sizeof(float));
+
+    const int num_heads = (int) rms_node->ne[1];
+    GGML_ASSERT(rms_node->ne[0] == 128 && rms_node->ne[2] == 1 && rms_node->ne[3] == 1);
+
+    block_q8_1 * dst_q8 = nullptr;
+    const int64_t ne10 = (int64_t) num_heads * 128;
+    if (ne10 == 4096 && ctx.curr_stream_no == 0 && ctx.q8_1_cache_buf != nullptr) {
+        constexpr int64_t ne10_padded = GGML_PAD(4096, MATRIX_ROW_PADDING);
+        constexpr size_t  q8_1_bytes  = (size_t) ne10_padded * sizeof(block_q8_1) / QK8_1;
+        constexpr size_t  aligned_b   = (q8_1_bytes + 255) & ~size_t(255);
+        if (ctx.q8_1_cache_used + aligned_b <= ctx.q8_1_cache_cap) {
+            ctx.q8_1_cache_invalidate_range(out_mul_node->data, ggml_nbytes(out_mul_node));
+            char * ptr = (char *) ctx.q8_1_cache_buf + ctx.q8_1_cache_used;
+            ctx.q8_1_cache_used += aligned_b;
+            ctx.q8_1_cache.push_back({
+                out_mul_node->data, ggml_nbytes(out_mul_node), GGML_TYPE_F32,
+                4096, 1, 1, 1, 4096, 4096, 4096, ptr
+            });
+            dst_q8 = (block_q8_1 *) ptr;
+        }
+    }
+
+    rms_norm_mul_silu_q8_1_128_f32<<<num_heads, 128, 0, ctx.stream()>>>(
+        (const float *) x->data,
+        (const float *) w->data,
+        (const float *) z->data,
+        (float *) out_mul_node->data,
+        dst_q8,
+        eps);
+#else
+    GGML_UNUSED_VARS(ctx, rms_node, norm_mul_node, silu_node, out_mul_node);
+    GGML_ABORT("unsupported");
+#endif
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void k_tower_embd_enorm_hnorm_concat_f32(
+        const half * __restrict__    embd_w,
+        const int32_t * __restrict__ code,
+        const float * __restrict__   mask,
+        const float * __restrict__   extra,
+        const float * __restrict__   enorm_w,
+        const float * __restrict__   x,
+        const float * __restrict__   hnorm_w,
+        float * __restrict__         dst,
+        const size_t                 embd_row_stride_h2,
+        const float                  eps_e,
+        const float                  eps_h) {
+    const int tid = threadIdx.x; // 0..511, each handles 4 floats (512 * 4 = 2048)
+    __shared__ float s_sum[32];
+
+    if (blockIdx.x == 0) {
+        const int32_t row = code[0];
+        const float   m   = mask[0];
+        const uint2   h4  = reinterpret_cast<const uint2 *>(embd_w)[(size_t) row * embd_row_stride_h2 + tid];
+        const float2  lo  = __half22float2(*reinterpret_cast<const half2 *>(&h4.x));
+        const float2  hi  = __half22float2(*reinterpret_cast<const half2 *>(&h4.y));
+        float4 e4 = make_float4(lo.x * m, lo.y * m, hi.x * m, hi.y * m);
+        if (extra != nullptr) {
+            const float4 ex4 = reinterpret_cast<const float4 *>(extra)[tid];
+            e4.x += ex4.x;
+            e4.y += ex4.y;
+            e4.z += ex4.z;
+            e4.w += ex4.w;
+        }
+        float sq = e4.x * e4.x + e4.y * e4.y + e4.z * e4.z + e4.w * e4.w;
+        sq = block_reduce<block_reduce_method::SUM, 512>(sq, s_sum);
+        const float scale = rsqrtf(sq / 2048.0f + eps_e);
+        const float4 w4   = reinterpret_cast<const float4 *>(enorm_w)[tid];
+        reinterpret_cast<float4 *>(dst)[tid] = make_float4(
+            scale * e4.x * w4.x,
+            scale * e4.y * w4.y,
+            scale * e4.z * w4.z,
+            scale * e4.w * w4.w);
+    } else {
+        const float4 x4 = reinterpret_cast<const float4 *>(x)[tid];
+        float sq = x4.x * x4.x + x4.y * x4.y + x4.z * x4.z + x4.w * x4.w;
+        sq = block_reduce<block_reduce_method::SUM, 512>(sq, s_sum);
+        const float scale = rsqrtf(sq / 2048.0f + eps_h);
+        const float4 w4   = reinterpret_cast<const float4 *>(hnorm_w)[tid];
+        reinterpret_cast<float4 *>(dst + 2048)[tid] = make_float4(
+            scale * x4.x * w4.x,
+            scale * x4.y * w4.y,
+            scale * x4.z * w4.z,
+            scale * x4.w * w4.w);
+    }
+}
+#endif
+
+void ggml_cuda_op_tower_eh_concat(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * embd_w,
+        const ggml_tensor * code,
+        const ggml_tensor * mask,
+        const ggml_tensor * extra,
+        const ggml_tensor * enorm_w,
+        const ggml_tensor * x,
+        const ggml_tensor * hnorm_w,
+        ggml_tensor * dst,
+        float eps_e,
+        float eps_h) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const size_t embd_row_stride_h2 = embd_w->nb[1] / (sizeof(half) * 4);
+    cudaStream_t stream = ctx.stream();
+    k_tower_embd_enorm_hnorm_concat_f32<<<2, 512, 0, stream>>>(
+        (const half *)    embd_w->data,
+        (const int32_t *) code->data,
+        (const float *)   mask->data,
+        extra ? (const float *) extra->data : nullptr,
+        (const float *)   enorm_w->data,
+        (const float *)   x->data,
+        (const float *)   hnorm_w->data,
+        (float *)         dst->data,
+        embd_row_stride_h2,
+        eps_e,
+        eps_h);
+#else
+    GGML_UNUSED_VARS(ctx, embd_w, code, mask, extra, enorm_w, x, hnorm_w, dst, eps_e, eps_h);
+    GGML_ABORT("unsupported");
+#endif
 }

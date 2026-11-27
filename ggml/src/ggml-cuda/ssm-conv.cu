@@ -206,3 +206,148 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+template <int d_conv, int head_dim>
+static __global__ void k_gdn_conv_silu_l2norm_f32(
+        const float * __restrict__ conv_states_all,
+        const int32_t * __restrict__ state_ids,
+        const float * __restrict__ qkv_mixed,
+        const float * __restrict__ conv_kernel,
+        float * __restrict__       state_cell_dst,
+        float * __restrict__       v_silu_dst,
+        float * __restrict__       q_norm_dst,
+        float * __restrict__       k_norm_dst,
+        const int64_t              state_in_row_stride,
+        const int64_t              conv_w_row_stride,
+        const int                  num_k_heads,
+        const float                eps_over_n,
+        const float                inv_sqrt_n) {
+    const int head = blockIdx.x;
+    const int tid  = threadIdx.x;
+    const int c    = head * head_dim + tid;
+
+    const int32_t row_idx = state_ids[0];
+    const float * st_in   = row_idx >= 0 ? conv_states_all + (int64_t) row_idx * state_in_row_stride : nullptr;
+
+    constexpr int n_hist = d_conv - 1;
+    const float h0 = st_in ? st_in[c * n_hist + 0] : 0.0f;
+    const float h1 = st_in ? st_in[c * n_hist + 1] : 0.0f;
+    const float h2 = st_in ? st_in[c * n_hist + 2] : 0.0f;
+    const float x  = qkv_mixed[c];
+
+    state_cell_dst[c * n_hist + 0] = h1;
+    state_cell_dst[c * n_hist + 1] = h2;
+    state_cell_dst[c * n_hist + 2] = x;
+
+    const float * wc = conv_kernel + (int64_t) c * conv_w_row_stride;
+    const float sum  = h0 * wc[0] + h1 * wc[1] + h2 * wc[2] + x * wc[3];
+    const float y    = ggml_cuda_op_silu_single(sum);
+
+    v_silu_dst[c] = y;
+
+    if (head < 2 * num_k_heads) {
+        __shared__ float s_warp[4];
+        const float sq   = y * y;
+        const float wsum = warp_reduce_sum<32>(sq);
+        const int warp   = tid >> 5;
+        const int lane   = tid & 31;
+        if (lane == 0) {
+            s_warp[warp] = wsum;
+        }
+        __syncthreads();
+
+        float total_sq = 0.0f;
+        if (warp == 0 && lane < 4) {
+            total_sq = s_warp[lane];
+        }
+        total_sq = warp_reduce_sum<4>(total_sq);
+        if (tid == 0) {
+            s_warp[0] = rsqrtf(total_sq / (float) head_dim + eps_over_n) * inv_sqrt_n;
+        }
+        __syncthreads();
+
+        const float normed = y * s_warp[0];
+        if (head < num_k_heads) {
+            q_norm_dst[c] = normed;
+        } else {
+            k_norm_dst[c - num_k_heads * head_dim] = normed;
+        }
+    }
+}
+
+void ggml_cuda_op_gdn_conv_silu_l2norm(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * conv_states_all,
+        const ggml_tensor * state_ids,
+        const ggml_tensor * qkv_mixed,
+        const ggml_tensor * conv_kernel,
+        ggml_tensor *       state_cell_dst,
+        ggml_tensor *       v_silu_dst,
+        ggml_tensor *       q_norm_dst,
+        ggml_tensor *       k_norm_dst,
+        int64_t             head_k_dim,
+        int64_t             num_k_heads,
+        float               eps_over_n,
+        float               inv_sqrt_n) {
+    GGML_ASSERT(head_k_dim == 128);
+    GGML_ASSERT(conv_kernel->ne[0] == 4);
+    const int64_t conv_channels = conv_kernel->ne[1];
+    GGML_ASSERT(conv_channels % head_k_dim == 0);
+    const int num_blocks = (int) (conv_channels / head_k_dim);
+
+    const int64_t state_in_row_stride = (int64_t) (conv_states_all->nb[1] / sizeof(float));
+    const int64_t conv_w_row_stride   = (int64_t) (conv_kernel->nb[1] / sizeof(float));
+
+    k_gdn_conv_silu_l2norm_f32<4, 128><<<num_blocks, 128, 0, ctx.stream()>>>(
+        (const float *) conv_states_all->data,
+        (const int32_t *) state_ids->data,
+        (const float *) qkv_mixed->data,
+        (const float *) conv_kernel->data,
+        (float *) state_cell_dst->data,
+        (float *) v_silu_dst->data,
+        (float *) q_norm_dst->data,
+        (float *) k_norm_dst->data,
+        state_in_row_stride,
+        conv_w_row_stride,
+        (int) num_k_heads,
+        eps_over_n,
+        inv_sqrt_n);
+}
+
+static __global__ void k_gdn_alpha_beta_f32(
+        const float * __restrict__ beta_in,
+        const float * __restrict__ alpha_in,
+        const float * __restrict__ ssm_dt,
+        const float * __restrict__ ssm_a,
+        float * __restrict__       beta_out,
+        float * __restrict__       gate_out,
+        const int                  n) {
+    const int i = threadIdx.x;
+    if (i < n) {
+        const float b = beta_in[i];
+        beta_out[i] = 1.0f / (1.0f + expf(-b));
+        const float ab = alpha_in[i] + ssm_dt[i];
+        const float sp = (ab > 20.0f) ? ab : log1pf(expf(ab));
+        gate_out[i] = sp * ssm_a[i];
+    }
+}
+
+void ggml_cuda_op_gdn_alpha_beta(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * beta_in,
+        const ggml_tensor * alpha_in,
+        const ggml_tensor * ssm_dt,
+        const ggml_tensor * ssm_a,
+        ggml_tensor *       beta_out,
+        ggml_tensor *       gate_out) {
+    const int n = (int) ggml_nelements(beta_out);
+    GGML_ASSERT(n > 0 && n <= 32);
+    k_gdn_alpha_beta_f32<<<1, 32, 0, ctx.stream()>>>(
+        (const float *) beta_in->data,
+        (const float *) alpha_in->data,
+        (const float *) ssm_dt->data,
+        (const float *) ssm_a->data,
+        (float *) beta_out->data,
+        (float *) gate_out->data,
+        n);
+}

@@ -6,6 +6,11 @@ struct ggml_cuda_gated_delta_net_fused_cache {
     float * data;        // rollback slot 0
     int64_t slot_stride; // between rollback slots (0 when K==1)
 
+    // fused state gather from recurrent cache table (null when not fused)
+    const float *   state_in_ptr        = nullptr;
+    const int32_t * state_ids           = nullptr;
+    int64_t         state_in_row_stride = 0;
+
     // rs_replay: the cpys of the k, v, g, beta inputs into the pending rows, null when not fused
     float * in_dst[4] = {};
     int64_t in_nb2[4] = {}; // token stride in elements

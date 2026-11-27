@@ -753,7 +753,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const best_fattn_kernel tile_kernel = Q->ne[0] == 576 && gqa_ratio % 4 != 0 ? BEST_FATTN_KERNEL_NONE : BEST_FATTN_KERNEL_TILE;
 
     if (volta_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
-        if (can_use_vector_kernel && Q->ne[1] * gqa_ratio_eff <= 2) {
+        if (can_use_vector_kernel && Q->ne[1] == 1 && gqa_ratio_eff <= 8) {
             return BEST_FATTN_KERNEL_VEC;
         }
         if (Q->ne[1] * gqa_ratio_eff <= 16) {

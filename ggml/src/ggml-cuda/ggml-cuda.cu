@@ -3355,6 +3355,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                const size_t prev_q8_cache_used = cuda_ctx->q8_1_cache_used;
                 int nodes_to_skip = ggml_cuda_fusion_disabled() ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -3364,7 +3365,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    const void * new_q8_src = (cuda_ctx->q8_1_cache_used > prev_q8_cache_used && !cuda_ctx->q8_1_cache.empty())
+                        ? cuda_ctx->q8_1_cache.back().src_data : nullptr;
                     for (int k = i; k <= i + nodes_to_skip; ++k) {
+                        if (new_q8_src != nullptr && cgraph->nodes[k]->data == new_q8_src) {
+                            continue;
+                        }
                         invalidate_tensor_q8_1(cgraph->nodes[k]);
                     }
                     i += nodes_to_skip;

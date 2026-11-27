@@ -290,50 +290,67 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
 
     // Qwen3Next uses a single Q projection that outputs query + gate
-    ggml_tensor * Qcur_full = nullptr;
-    ggml_tensor * Kcur      = nullptr;
-    ggml_tensor * Vcur      = nullptr;
+    ggml_tensor * Qcur = nullptr;
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * Kcur = nullptr;
+    ggml_tensor * Vcur = nullptr;
     if (model.layers[il].wqk != nullptr && (!loras || loras->empty()) && n_tokens == 1 && hparams.f_clamp_kqv == 0.0f) {
         const int64_t n_q = model.layers[il].wq->ne[1];
+        const int64_t n_q_half = n_q / 2;
         const int64_t n_k = model.layers[il].wk->ne[1];
+        const int64_t n_v = model.layers[il].wv ? model.layers[il].wv->ne[1] : 0;
         ggml_tensor * qk = ggml_mul_mat(ctx0, model.layers[il].wqk, cur);
-        Qcur_full = ggml_view_2d(ctx0, qk, n_q, 1, qk->nb[1], 0);
-        Kcur      = ggml_view_2d(ctx0, qk, n_k, 1, qk->nb[1], (size_t) n_q * qk->nb[0]);
-        Vcur      = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+        Qcur = ggml_reshape_3d(ctx0, ggml_view_2d(ctx0, qk, n_q_half, 1, qk->nb[1], 0), n_embd_head, n_head, n_tokens);
+        gate = ggml_view_2d(ctx0, qk, n_q_half, 1, qk->nb[1], (size_t) n_q_half * qk->nb[0]);
+        Kcur = ggml_view_2d(ctx0, qk, n_k,      1, qk->nb[1], (size_t) n_q * qk->nb[0]);
+        if (n_v > 0 && model.layers[il].wqk->ne[1] == n_q + n_k + n_v) {
+            Vcur = ggml_view_2d(ctx0, qk, n_v, 1, qk->nb[1], (size_t) (n_q + n_k) * qk->nb[0]);
+        } else {
+            Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+        }
+        cb(Kcur, "Kcur", il);
+        cb(Vcur, "Vcur", il);
+        cb(Qcur, "Qcur_reshaped", il);
+
+        Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Qcur, "Qcur_normed", il);
+
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "Kcur_normed", il);
+        cb(gate, "gate_reshaped", il);
     } else {
         auto qkv = build_qkv(model.layers[il], cur,
                 n_embd_head * 2, n_head,
                 n_embd_head,     n_head_kv,
                 n_embd_head,     n_head_kv,
                 il, false);
-        Qcur_full = qkv.q;
-        Kcur      = qkv.k;
-        Vcur      = qkv.v;
+        ggml_tensor * Qcur_full = qkv.q;
+        Kcur = qkv.k;
+        Vcur = qkv.v;
+        cb(Qcur_full, "Qcur_full", il);
+        cb(Kcur, "Kcur", il);
+        cb(Vcur, "Vcur", il);
+
+        Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+        cb(Qcur, "Qcur_reshaped", il);
+
+        Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Qcur, "Qcur_normed", il);
+
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "Kcur_normed", il);
+
+        gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+            ggml_element_size(Qcur_full) * n_embd_head * 2,
+            ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
+            ggml_element_size(Qcur_full) * n_embd_head);
+        gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
+        cb(gate, "gate_reshaped", il);
     }
-    cb(Qcur_full, "Qcur_full", il);
-    cb(Kcur, "Kcur", il);
-    cb(Vcur, "Vcur", il);
-
-    ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
-    cb(Qcur, "Qcur_reshaped", il);
-
-    // Apply Q normalization
-    Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Qcur, "Qcur_normed", il);
-
-    // Apply K normalization
-    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
-    cb(Kcur, "Kcur_normed", il);
-
-    ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
-        ggml_element_size(Qcur_full) * n_embd_head * 2,
-        ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,
-        ggml_element_size(Qcur_full) * n_embd_head);
-    gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
-    cb(gate, "gate_reshaped", il);
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
@@ -389,23 +406,31 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * beta      = nullptr;
     ggml_tensor * alpha     = nullptr;
     if (model.layers[il].wqkv_gate_ab != nullptr && (!loras || loras->empty()) && n_seq_tokens == 1 && n_seqs == 1) {
-        qkv_mixed = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
+        const int64_t n_qkv = model.layers[il].wqkv ? model.layers[il].wqkv->ne[1] : 0;
+        const int64_t n_z   = model.layers[il].wqkv_gate->ne[1];
+        const int64_t n_a   = model.layers[il].ssm_alpha->ne[1];
+        const int64_t n_b   = model.layers[il].ssm_beta->ne[1];
+        const bool has_qkv  = (n_qkv > 0 && model.layers[il].wqkv_gate_ab->ne[1] == n_qkv + n_z + n_a + n_b);
+
+        ggml_tensor * gate_ab = ggml_mul_mat(ctx0, model.layers[il].wqkv_gate_ab, cur);
+        size_t z_off = 0;
+        if (has_qkv) {
+            qkv_mixed = ggml_view_2d(ctx0, gate_ab, n_qkv, 1, gate_ab->nb[1], 0);
+            z_off = (size_t) n_qkv * gate_ab->nb[0];
+        } else {
+            qkv_mixed = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
+        }
         qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
         cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
-        ggml_tensor * gate_ab = ggml_mul_mat(ctx0, model.layers[il].wqkv_gate_ab, cur);
-        const int64_t n_z = model.layers[il].wqkv_gate->ne[1];
-        const int64_t n_a = model.layers[il].ssm_alpha->ne[1];
-        const int64_t n_b = model.layers[il].ssm_beta->ne[1];
-
-        z = ggml_view_2d(ctx0, gate_ab, n_z, 1, gate_ab->nb[1], 0);
+        z = ggml_view_2d(ctx0, gate_ab, n_z, 1, gate_ab->nb[1], z_off);
         cb(z, "z", il);
 
-        alpha = ggml_view_2d(ctx0, gate_ab, n_a, 1, gate_ab->nb[1], (size_t) n_z * gate_ab->nb[0]);
+        alpha = ggml_view_2d(ctx0, gate_ab, n_a, 1, gate_ab->nb[1], z_off + (size_t) n_z * gate_ab->nb[0]);
         alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
         cb(alpha, "alpha", il);
 
-        beta = ggml_view_2d(ctx0, gate_ab, n_b, 1, gate_ab->nb[1], (size_t) (n_z + n_a) * gate_ab->nb[0]);
+        beta = ggml_view_2d(ctx0, gate_ab, n_b, 1, gate_ab->nb[1], z_off + (size_t) (n_z + n_a) * gate_ab->nb[0]);
         beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
         cb(beta, "beta", il);
         beta = ggml_sigmoid(ctx0, beta);
@@ -436,6 +461,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_build_forward_expand(gf, z);
+    ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, gate);
+
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
 
@@ -444,10 +474,6 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
-
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
@@ -497,6 +523,16 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(q_conv, "q_conv_predelta", il);
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
+
+    ggml_build_forward_expand(gf, q_conv);
+    ggml_build_forward_expand(gf, k_conv);
+    ggml_build_forward_expand(gf, v_conv);
+    ggml_build_forward_expand(gf, gate);
+    ggml_build_forward_expand(gf, beta);
+
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 

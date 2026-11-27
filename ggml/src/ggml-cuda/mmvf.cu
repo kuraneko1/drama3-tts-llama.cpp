@@ -666,6 +666,295 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#ifndef GGML_CUDA_MMVF_VEC4_RPB
+#define GGML_CUDA_MMVF_VEC4_RPB 8
+#endif
+
+template <int ROWS_PER_BLOCK, bool HAS_GATE, bool HAS_BIAS, bool HAS_GATE_BIAS>
+static __global__ void mul_mat_vec_f16_vec4(
+        const half * __restrict__ x,
+        const float * __restrict__ y,
+        const ggml_cuda_mm_fusion_args_device fusion,
+        float * __restrict__ dst,
+        const int ncols8,
+        const int nrows,
+        const int stride_row) {
+    const int lane = threadIdx.x;
+    const int row  = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= nrows) {
+        return;
+    }
+
+    const uint4  * __restrict__ x8 = (const uint4  *) (x + (int64_t) row * stride_row);
+    const float4 * __restrict__ y4 = (const float4 *) y;
+    const uint4  * __restrict__ g8 = HAS_GATE
+        ? (const uint4 *) ((const half *) fusion.gate + (int64_t) row * stride_row)
+        : nullptr;
+
+    float sumf      = 0.0f;
+    float sumf_gate = 0.0f;
+
+    for (int c8 = lane; c8 < ncols8; c8 += 32) {
+        const uint4  xv  = __ldg(&x8[c8]);
+        const float4 yv0 = __ldg(&y4[2 * c8]);
+        const float4 yv1 = __ldg(&y4[2 * c8 + 1]);
+
+        const half2 * xh = reinterpret_cast<const half2 *>(&xv);
+        const float2 x0 = __half22float2(xh[0]);
+        const float2 x1 = __half22float2(xh[1]);
+        const float2 x2 = __half22float2(xh[2]);
+        const float2 x3 = __half22float2(xh[3]);
+
+        sumf = fmaf(x0.x, yv0.x, sumf);
+        sumf = fmaf(x0.y, yv0.y, sumf);
+        sumf = fmaf(x1.x, yv0.z, sumf);
+        sumf = fmaf(x1.y, yv0.w, sumf);
+        sumf = fmaf(x2.x, yv1.x, sumf);
+        sumf = fmaf(x2.y, yv1.y, sumf);
+        sumf = fmaf(x3.x, yv1.z, sumf);
+        sumf = fmaf(x3.y, yv1.w, sumf);
+
+        if constexpr (HAS_GATE) {
+            const uint4 gv = __ldg(&g8[c8]);
+            const half2 * gh = reinterpret_cast<const half2 *>(&gv);
+            const float2 g0 = __half22float2(gh[0]);
+            const float2 g1 = __half22float2(gh[1]);
+            const float2 g2 = __half22float2(gh[2]);
+            const float2 g3 = __half22float2(gh[3]);
+
+            sumf_gate = fmaf(g0.x, yv0.x, sumf_gate);
+            sumf_gate = fmaf(g0.y, yv0.y, sumf_gate);
+            sumf_gate = fmaf(g1.x, yv0.z, sumf_gate);
+            sumf_gate = fmaf(g1.y, yv0.w, sumf_gate);
+            sumf_gate = fmaf(g2.x, yv1.x, sumf_gate);
+            sumf_gate = fmaf(g2.y, yv1.y, sumf_gate);
+            sumf_gate = fmaf(g3.x, yv1.z, sumf_gate);
+            sumf_gate = fmaf(g3.y, yv1.w, sumf_gate);
+        }
+    }
+
+    sumf = warp_reduce_sum<32>(sumf);
+    if constexpr (HAS_GATE) {
+        sumf_gate = warp_reduce_sum<32>(sumf_gate);
+    }
+
+    if (lane != 0) {
+        return;
+    }
+
+    float value = sumf;
+    if constexpr (HAS_BIAS) {
+        value += ((const float *) fusion.x_bias)[row];
+    }
+    if constexpr (HAS_GATE) {
+        float gate_value = sumf_gate;
+        if constexpr (HAS_GATE_BIAS) {
+            gate_value += ((const float *) fusion.gate_bias)[row];
+        }
+        switch (fusion.glu_op) {
+            case GGML_GLU_OP_SWIGLU:
+                value *= ggml_cuda_op_silu_single(gate_value);
+                break;
+            case GGML_GLU_OP_GEGLU:
+                value *= ggml_cuda_op_gelu_single(gate_value);
+                break;
+            case GGML_GLU_OP_SWIGLU_OAI:
+                value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
+                break;
+            case GGML_GLU_OP_SWIGLU_CLAMP:
+                value = ggml_cuda_op_swiglu_clamp_single(gate_value, value, fusion.glu_limit);
+                break;
+            default:
+                break;
+        }
+    }
+    dst[row] = value;
+}
+
+template <int NWARPS>
+__launch_bounds__(32 * NWARPS, 2)
+static __global__ void mul_mat_vec_f16_vec4_splitk(
+        const half * __restrict__ x,
+        const float * __restrict__ y,
+        float * __restrict__ dst,
+        const int ncols8,
+        const int nrows,
+        const int stride_row) {
+    const int row  = blockIdx.x;
+    if (row >= nrows) {
+        return;
+    }
+    const int lane = threadIdx.x;
+    const int w    = threadIdx.y;
+
+    const uint4  * __restrict__ x4 = reinterpret_cast<const uint4 *>(x + (int64_t) row * stride_row);
+    const float4 * __restrict__ y4 = reinterpret_cast<const float4 *>(y);
+
+    float sumf = 0.0f;
+    for (int col8 = w * 32 + lane; col8 < ncols8; col8 += NWARPS * 32) {
+        const uint4 xv = x4[col8];
+        const float4 yv0 = y4[2 * col8 + 0];
+        const float4 yv1 = y4[2 * col8 + 1];
+
+        const float2 x0 = __half22float2(*reinterpret_cast<const half2 *>(&xv.x));
+        const float2 x1 = __half22float2(*reinterpret_cast<const half2 *>(&xv.y));
+        const float2 x2 = __half22float2(*reinterpret_cast<const half2 *>(&xv.z));
+        const float2 x3 = __half22float2(*reinterpret_cast<const half2 *>(&xv.w));
+
+        sumf = fmaf(x0.x, yv0.x, sumf);
+        sumf = fmaf(x0.y, yv0.y, sumf);
+        sumf = fmaf(x1.x, yv0.z, sumf);
+        sumf = fmaf(x1.y, yv0.w, sumf);
+        sumf = fmaf(x2.x, yv1.x, sumf);
+        sumf = fmaf(x2.y, yv1.y, sumf);
+        sumf = fmaf(x3.x, yv1.z, sumf);
+        sumf = fmaf(x3.y, yv1.w, sumf);
+    }
+
+    sumf = warp_reduce_sum<32>(sumf);
+
+    __shared__ float s_part[NWARPS];
+    if (lane == 0) {
+        s_part[w] = sumf;
+    }
+    __syncthreads();
+
+    if (w == 0) {
+        float val = (lane < NWARPS) ? s_part[lane] : 0.0f;
+#pragma unroll
+        for (int m = NWARPS / 2; m > 0; m >>= 1) {
+            val += __shfl_xor_sync(0xffffffff, val, m);
+        }
+        if (lane == 0) {
+            dst[row] = val;
+        }
+    }
+}
+
+template <int RPB, bool HAS_BIAS>
+__launch_bounds__(32 * RPB * 2, 2)
+static __global__ void mul_mat_vec_f16_vec4_2wpr(
+        const half * __restrict__ x,
+        const float * __restrict__ y,
+        const ggml_cuda_mm_fusion_args_device fusion,
+        float * __restrict__ dst,
+        const int ncols8,
+        const int nrows,
+        const int stride_row) {
+    const int row_in_blk = threadIdx.y >> 1;
+    const int w_id       = threadIdx.y & 1;
+    const int row        = blockIdx.x * RPB + row_in_blk;
+    const int lane       = threadIdx.x;
+
+    float sumf = 0.0f;
+    if (row < nrows) {
+        const uint4  * __restrict__ x4 = reinterpret_cast<const uint4 *>(x + (int64_t) row * stride_row);
+        const float4 * __restrict__ y4 = reinterpret_cast<const float4 *>(y);
+
+        for (int col8 = w_id * 32 + lane; col8 < ncols8; col8 += 64) {
+            const uint4 xv = x4[col8];
+            const float4 yv0 = y4[2 * col8 + 0];
+            const float4 yv1 = y4[2 * col8 + 1];
+
+            const float2 x0 = __half22float2(*reinterpret_cast<const half2 *>(&xv.x));
+            const float2 x1 = __half22float2(*reinterpret_cast<const half2 *>(&xv.y));
+            const float2 x2 = __half22float2(*reinterpret_cast<const half2 *>(&xv.z));
+            const float2 x3 = __half22float2(*reinterpret_cast<const half2 *>(&xv.w));
+
+            sumf = fmaf(x0.x, yv0.x, sumf);
+            sumf = fmaf(x0.y, yv0.y, sumf);
+            sumf = fmaf(x1.x, yv0.z, sumf);
+            sumf = fmaf(x1.y, yv0.w, sumf);
+            sumf = fmaf(x2.x, yv1.x, sumf);
+            sumf = fmaf(x2.y, yv1.y, sumf);
+            sumf = fmaf(x3.x, yv1.z, sumf);
+            sumf = fmaf(x3.y, yv1.w, sumf);
+        }
+        sumf = warp_reduce_sum<32>(sumf);
+    }
+
+    __shared__ float s_part[RPB];
+    if (w_id == 1 && lane == 0) {
+        s_part[row_in_blk] = sumf;
+    }
+    __syncthreads();
+
+    if (w_id == 0 && lane == 0 && row < nrows) {
+        float val = sumf + s_part[row_in_blk];
+        if constexpr (HAS_BIAS) {
+            val += ((const float *) fusion.x_bias)[row];
+        }
+        dst[row] = val;
+    }
+}
+
+static void launch_mul_mat_vec_f16_vec4(
+        const half * x,
+        const float * y,
+        const ggml_cuda_mm_fusion_args_device fusion,
+        float * dst,
+        const int64_t ncols,
+        const int64_t nrows,
+        const int64_t stride_row,
+        cudaStream_t stream) {
+    constexpr int RPB = GGML_CUDA_MMVF_VEC4_RPB;
+    const dim3 block_dims(32, RPB, 1);
+    const dim3 block_nums((nrows + RPB - 1) / RPB, 1, 1);
+    const int ncols8 = (int) (ncols / 8);
+
+    const bool has_gate      = fusion.gate != nullptr;
+    const bool has_bias      = fusion.x_bias != nullptr;
+    const bool has_gate_bias = fusion.gate_bias != nullptr;
+
+    if (!has_gate && !has_bias && !has_gate_bias && nrows <= 512 && ncols >= 1024 && ncols8 % 4 == 0) {
+        constexpr int NWARPS = 4;
+        const dim3 sk_blocks(nrows, 1, 1);
+        const dim3 sk_threads(32, NWARPS, 1);
+        mul_mat_vec_f16_vec4_splitk<NWARPS><<<sk_blocks, sk_threads, 0, stream>>>(x, y, dst, ncols8, (int) nrows, (int) stride_row);
+        return;
+    }
+
+    if (!has_gate && !has_gate_bias && nrows > 512 && nrows <= 2048 && ncols >= 4096 && ncols % 16 == 0) {
+        constexpr int RPB_2W = 4;
+        const dim3 sk_blocks((nrows + RPB_2W - 1) / RPB_2W, 1, 1);
+        const dim3 sk_threads(32, RPB_2W * 2, 1);
+        if (!has_bias) {
+            mul_mat_vec_f16_vec4_2wpr<RPB_2W, false><<<sk_blocks, sk_threads, 0, stream>>>(x, y, fusion, dst, ncols8, (int) nrows, (int) stride_row);
+        } else {
+            mul_mat_vec_f16_vec4_2wpr<RPB_2W, true><<<sk_blocks, sk_threads, 0, stream>>>(x, y, fusion, dst, ncols8, (int) nrows, (int) stride_row);
+        }
+        return;
+    }
+
+    if (!has_gate) {
+        if (!has_bias) {
+            mul_mat_vec_f16_vec4<RPB, false, false, false><<<block_nums, block_dims, 0, stream>>>(
+                x, y, fusion, dst, ncols8, (int) nrows, (int) stride_row);
+        } else {
+            mul_mat_vec_f16_vec4<RPB, false, true, false><<<block_nums, block_dims, 0, stream>>>(
+                x, y, fusion, dst, ncols8, (int) nrows, (int) stride_row);
+        }
+    } else if (!has_bias) {
+        if (!has_gate_bias) {
+            mul_mat_vec_f16_vec4<RPB, true, false, false><<<block_nums, block_dims, 0, stream>>>(
+                x, y, fusion, dst, ncols8, (int) nrows, (int) stride_row);
+        } else {
+            mul_mat_vec_f16_vec4<RPB, true, false, true><<<block_nums, block_dims, 0, stream>>>(
+                x, y, fusion, dst, ncols8, (int) nrows, (int) stride_row);
+        }
+    } else {
+        if (!has_gate_bias) {
+            mul_mat_vec_f16_vec4<RPB, true, true, false><<<block_nums, block_dims, 0, stream>>>(
+                x, y, fusion, dst, ncols8, (int) nrows, (int) stride_row);
+        } else {
+            mul_mat_vec_f16_vec4<RPB, true, true, true><<<block_nums, block_dims, 0, stream>>>(
+                x, y, fusion, dst, ncols8, (int) nrows, (int) stride_row);
+        }
+    }
+}
+#endif
+
 template<typename T, typename T_y>
 static void mul_mat_vec_f_cuda(
         const T * x, const T_y * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -675,6 +964,22 @@ static void mul_mat_vec_f_cuda(
         const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst, const int64_t nsamples_x,
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         const int64_t ids_stride, enum ggml_prec prec, cudaStream_t stream) {
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (std::is_same_v<T, half> && std::is_same_v<T_y, float>) {
+        const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+        if (warp_size == 32 && ncols_dst == 1 && ids == nullptr &&
+            ncols >= 256 && ncols % 8 == 0 && stride_row % 8 == 0 &&
+            ((uintptr_t) x & 15) == 0 && ((uintptr_t) y & 15) == 0 &&
+            (!fusion.gate || ((uintptr_t) fusion.gate & 15) == 0) &&
+            fusion.x_scale == nullptr && fusion.gate_scale == nullptr &&
+            nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1 &&
+            nsamples_x == 1 && nsamples_dst == 1) {
+            launch_mul_mat_vec_f16_vec4(x, y, fusion, dst, ncols, nrows, stride_row, stream);
+            return;
+        }
+    }
+#endif
 
     if constexpr(std::is_same_v<T, half>) {
         if (prec == GGML_PREC_UNDEFINED) {

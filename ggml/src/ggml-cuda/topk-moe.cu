@@ -356,6 +356,134 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 }
 
+static __global__ void topk_moe_256_row1_cuda(
+        const float * __restrict__ logits,
+        float * __restrict__       weights,
+        int32_t * __restrict__     ids,
+        const int                  n_expert_used,
+        const float                clamp_val,
+        const float                scale_val,
+        const topk_moe_config      config) {
+    const int tid  = threadIdx.x; // 0..255
+    const int w    = tid >> 5;    // 0..7
+    const int lane = tid & 31;    // 0..31
+
+    __shared__ float s_red[8];
+    __shared__ float s_bmax;
+    __shared__ float s_bsum;
+    __shared__ float s_wt[256];
+
+    const float v = logits[tid];
+
+    // Phase 1: block-wide max
+    float wmax = v;
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        wmax = fmaxf(wmax, __shfl_xor_sync(0xffffffff, wmax, m));
+    }
+    if (lane == 0) {
+        s_red[w] = wmax;
+    }
+    __syncthreads();
+    if (w == 0) {
+        float bmax = (lane < 8) ? s_red[lane] : -INFINITY;
+#pragma unroll
+        for (int m = 4; m > 0; m >>= 1) {
+            bmax = fmaxf(bmax, __shfl_xor_sync(0xffffffff, bmax, m));
+        }
+        if (lane == 0) {
+            s_bmax = bmax;
+        }
+    }
+    __syncthreads();
+
+    // Phase 2: exp and block-wide sum
+    const float e = expf(v - s_bmax);
+    float wsum = e;
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        wsum += __shfl_xor_sync(0xffffffff, wsum, m);
+    }
+    if (lane == 0) {
+        s_red[w] = wsum;
+    }
+    __syncthreads();
+    if (w == 0) {
+        float bsum = (lane < 8) ? s_red[lane] : 0.0f;
+#pragma unroll
+        for (int m = 4; m > 0; m >>= 1) {
+            bsum += __shfl_xor_sync(0xffffffff, bsum, m);
+        }
+        if (lane == 0) {
+            s_bsum = bsum;
+        }
+    }
+    __syncthreads();
+
+    // Phase 3: normalized softmax -> shared memory
+    float wt = e / s_bsum;
+    if (__isnanf(wt)) {
+        wt = -FLT_MAX;
+    }
+    s_wt[tid] = wt;
+    __syncthreads();
+
+    // Phase 4: warp 0 performs top-k argmax purely in registers with 0 barriers
+    if (w != 0) {
+        return;
+    }
+
+    float r[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        r[i] = s_wt[i * 32 + lane];
+    }
+
+    float out_w  = 0.0f;
+    float wt_sum = 0.0f;
+    for (int k = 0; k < n_expert_used; ++k) {
+        float best_val = r[0];
+        int   best_idx = lane;
+#pragma unroll
+        for (int i = 1; i < 8; ++i) {
+            const int idx = i * 32 + lane;
+            if (r[i] > best_val) {
+                best_val = r[i];
+                best_idx = idx;
+            }
+        }
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffff, best_val, m);
+            const int   oi = __shfl_xor_sync(0xffffffff, best_idx, m);
+            if (ov > best_val || (ov == best_val && oi < best_idx)) {
+                best_val = ov;
+                best_idx = oi;
+            }
+        }
+        if ((best_idx & 31) == lane) {
+            r[best_idx >> 5] = -INFINITY;
+        }
+        if (k == lane) {
+            out_w = best_val;
+        }
+        if (lane == 0) {
+            ids[k] = best_idx;
+            if (config.with_norm) {
+                wt_sum += best_val;
+            }
+        }
+    }
+
+    wt_sum = __shfl_sync(0xffffffff, wt_sum, 0);
+    if (lane < n_expert_used) {
+        float val = out_w;
+        if (config.with_norm) {
+            val /= (fmaxf(wt_sum, clamp_val) + config.norm_bias);
+        }
+        weights[lane] = val * scale_val;
+    }
+}
 template<bool has_bias>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
@@ -375,6 +503,14 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
     dim3         grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
     dim3         block_dims(warp_size, rows_per_block, 1);
     cudaStream_t stream = ctx.stream();
+    if constexpr (!has_bias) {
+        if (warp_size == 32 && n_rows == 1 && n_expert == 256 &&
+                config.n_groups == 0 && !config.delayed_softmax &&
+                !config.use_sigmoid && !config.use_sqrt_softplus && n_expert_used <= 32) {
+            topk_moe_256_row1_cuda<<<1, 256, 0, stream>>>(logits, weights, ids, n_expert_used, clamp_val, scale_val, config);
+            return;
+        }
+    }
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
 
     switch (n_expert) {
