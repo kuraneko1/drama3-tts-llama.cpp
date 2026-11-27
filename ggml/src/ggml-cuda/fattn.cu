@@ -842,8 +842,262 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+template <int NW, bool WITH_GATE>
+__launch_bounds__(NW * 32, 2)
+static __global__ void k_fattn_1pass_d256_sm70(
+        const char * __restrict__ Q,
+        const char * __restrict__ K,
+        const char * __restrict__ V,
+        const half * __restrict__ mask,
+        const float * __restrict__ gate,
+        float * __restrict__      dst,
+        const size_t              Q_nb2,
+        const size_t              K_nb1,
+        const size_t              K_nb2,
+        const size_t              V_nb1,
+        const size_t              V_nb2,
+        const int                 n_kv,
+        const float               scale) {
+    const int qh   = blockIdx.x;
+    const int kvh  = qh >> 3;
+    const int lane = threadIdx.x; // 0..31 -> 8 dims per lane
+    const int w    = threadIdx.y; // 0..NW-1
+
+    const float4 * __restrict__ q4p = reinterpret_cast<const float4 *>(Q + (size_t) qh * Q_nb2);
+    float4 q0 = q4p[2 * lane + 0];
+    float4 q1 = q4p[2 * lane + 1];
+    q0.x *= scale; q0.y *= scale; q0.z *= scale; q0.w *= scale;
+    q1.x *= scale; q1.y *= scale; q1.z *= scale; q1.w *= scale;
+
+    const char * __restrict__ K_h = K + (size_t) kvh * K_nb2;
+    const char * __restrict__ V_h = V + (size_t) kvh * V_nb2;
+
+    float m_max = -1e30f;
+    float l_sum = 0.0f;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+    float o4 = 0.0f, o5 = 0.0f, o6 = 0.0f, o7 = 0.0f;
+
+    for (int t = w; t < n_kv; t += NW) {
+        const float mv = mask ? __half2float(mask[t]) : 0.0f;
+        if (mv < -3e4f) {
+            continue;
+        }
+        const uint4 kv = reinterpret_cast<const uint4 *>(K_h + (size_t) t * K_nb1)[lane];
+        const float2 k0 = __half22float2(*reinterpret_cast<const half2 *>(&kv.x));
+        const float2 k1 = __half22float2(*reinterpret_cast<const half2 *>(&kv.y));
+        const float2 k2 = __half22float2(*reinterpret_cast<const half2 *>(&kv.z));
+        const float2 k3 = __half22float2(*reinterpret_cast<const half2 *>(&kv.w));
+
+        float dot = k0.x * q0.x + k0.y * q0.y + k1.x * q0.z + k1.y * q0.w
+                  + k2.x * q1.x + k2.y * q1.y + k3.x * q1.z + k3.y * q1.w;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            dot += __shfl_xor_sync(0xffffffff, dot, off);
+        }
+        dot += mv;
+
+        const float m_new = fmaxf(m_max, dot);
+        const float alpha = expf(m_max - m_new);
+        const float p     = expf(dot - m_new);
+        l_sum = l_sum * alpha + p;
+        m_max = m_new;
+
+        const uint4 vv = reinterpret_cast<const uint4 *>(V_h + (size_t) t * V_nb1)[lane];
+        const float2 v0 = __half22float2(*reinterpret_cast<const half2 *>(&vv.x));
+        const float2 v1 = __half22float2(*reinterpret_cast<const half2 *>(&vv.y));
+        const float2 v2 = __half22float2(*reinterpret_cast<const half2 *>(&vv.z));
+        const float2 v3 = __half22float2(*reinterpret_cast<const half2 *>(&vv.w));
+
+        o0 = fmaf(p, v0.x, o0 * alpha); o1 = fmaf(p, v0.y, o1 * alpha);
+        o2 = fmaf(p, v1.x, o2 * alpha); o3 = fmaf(p, v1.y, o3 * alpha);
+        o4 = fmaf(p, v2.x, o4 * alpha); o5 = fmaf(p, v2.y, o5 * alpha);
+        o6 = fmaf(p, v3.x, o6 * alpha); o7 = fmaf(p, v3.y, o7 * alpha);
+    }
+
+    __shared__ float s_m[NW];
+    __shared__ float s_l[NW];
+    __shared__ float s_o[NW][256];
+
+    if (lane == 0) {
+        s_m[w] = m_max;
+        s_l[w] = l_sum;
+    }
+    s_o[w][lane * 8 + 0] = o0; s_o[w][lane * 8 + 1] = o1;
+    s_o[w][lane * 8 + 2] = o2; s_o[w][lane * 8 + 3] = o3;
+    s_o[w][lane * 8 + 4] = o4; s_o[w][lane * 8 + 5] = o5;
+    s_o[w][lane * 8 + 6] = o6; s_o[w][lane * 8 + 7] = o7;
+    __syncthreads();
+
+    const int tid = w * 32 + lane;
+    if (tid < 256) {
+        float gm = -1e30f;
+#pragma unroll
+        for (int i = 0; i < NW; ++i) {
+            if (s_l[i] > 0.0f) {
+                gm = fmaxf(gm, s_m[i]);
+            }
+        }
+        float gl = 0.0f;
+        float go = 0.0f;
+#pragma unroll
+        for (int i = 0; i < NW; ++i) {
+            if (s_l[i] > 0.0f) {
+                const float wt = expf(s_m[i] - gm);
+                gl += s_l[i] * wt;
+                go += s_o[i][tid] * wt;
+            }
+        }
+        float val = (gl > 0.0f) ? (go / gl) : 0.0f;
+        if constexpr (WITH_GATE) {
+            const float g = gate[(size_t) qh * 256 + tid];
+            val *= 1.0f / (1.0f + expf(-g));
+        }
+        dst[(size_t) qh * 256 + tid] = val;
+    }
+}
+
+static bool fattn_1pass_d256_sm70_eligible(int cc, const ggml_tensor * fa_node, bool check_ptrs) {
+    if (cc != GGML_CUDA_CC_VOLTA || !fa_node || fa_node->op != GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+    const ggml_tensor * Q    = fa_node->src[0];
+    const ggml_tensor * K    = fa_node->src[1];
+    const ggml_tensor * V    = fa_node->src[2];
+    const ggml_tensor * mask = fa_node->src[3];
+    if (!Q || !K || !V ||
+            Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 ||
+            fa_node->type != GGML_TYPE_F32 ||
+            Q->ne[0] != 256 || Q->ne[1] != 1 || Q->ne[3] != 1 ||
+            K->ne[0] != 256 || V->ne[0] != 256 || K->ne[3] != 1 || V->ne[3] != 1 ||
+            K->ne[2] <= 0 || Q->ne[2] != K->ne[2] * 8 || K->ne[2] != V->ne[2] ||
+            K->ne[1] != V->ne[1] || K->ne[1] <= 0 || K->ne[1] > 256 ||
+            fa_node->src[4] != nullptr || fa_node->src[5] != nullptr) {
+        return false;
+    }
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) fa_node->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) fa_node->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    if (mask != nullptr && (mask->type != GGML_TYPE_F16 || !ggml_is_contiguous(mask) ||
+            mask->ne[0] < K->ne[1] || mask->ne[1] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1)) {
+        return false;
+    }
+    if (Q->nb[0] != sizeof(float) || K->nb[0] != sizeof(half) || V->nb[0] != sizeof(half) ||
+            fa_node->nb[0] != sizeof(float) || !ggml_is_contiguous(fa_node)) {
+        return false;
+    }
+    if ((Q->nb[2] & 15) != 0 || (K->nb[1] & 15) != 0 || (K->nb[2] & 15) != 0 ||
+            (V->nb[1] & 15) != 0 || (V->nb[2] & 15) != 0) {
+        return false;
+    }
+    if (check_ptrs) {
+        if (!Q->data || !K->data || !V->data || (mask && !mask->data) ||
+                ((uintptr_t) Q->data & 15) != 0 ||
+                ((uintptr_t) K->data & 15) != 0 ||
+                ((uintptr_t) V->data & 15) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+bool ggml_cuda_flash_attn_ext_can_fuse_gate(int device, const ggml_tensor * fa_node, const ggml_tensor * gate, const ggml_tensor * dst, bool check_ptrs) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!fattn_1pass_d256_sm70_eligible(cc, fa_node, check_ptrs)) {
+        return false;
+    }
+    if (!gate || !dst || gate->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(gate) || !ggml_is_contiguous(dst) ||
+            ggml_nelements(gate) != fa_node->src[0]->ne[2] * 256 ||
+            ggml_nelements(dst) != fa_node->src[0]->ne[2] * 256) {
+        return false;
+    }
+    if (check_ptrs) {
+        if (!gate->data || !dst->data ||
+                ((uintptr_t) gate->data & 3) != 0 || ((uintptr_t) dst->data & 3) != 0) {
+            return false;
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(device, fa_node, gate, dst, check_ptrs);
+    return false;
+#endif
+}
+
+void ggml_cuda_flash_attn_ext_gated(ggml_backend_cuda_context & ctx, ggml_tensor * fa_node, const ggml_tensor * gate, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const ggml_tensor * Q    = fa_node->src[0];
+    const ggml_tensor * K    = fa_node->src[1];
+    const ggml_tensor * V    = fa_node->src[2];
+    const ggml_tensor * mask = fa_node->src[3];
+    float scale = 1.0f;
+    memcpy(&scale, (const float *) fa_node->op_params + 0, sizeof(float));
+
+    const int n_head = (int) Q->ne[2];
+    const int n_kv   = (int) K->ne[1];
+    const dim3 grid(n_head, 1, 1);
+    const dim3 block(32, 16, 1);
+    k_fattn_1pass_d256_sm70<16, true><<<grid, block, 0, ctx.stream()>>>(
+        (const char *) Q->data,
+        (const char *) K->data,
+        (const char *) V->data,
+        mask ? (const half *) mask->data : nullptr,
+        (const float *) gate->data,
+        (float *) dst->data,
+        Q->nb[2],
+        K->nb[1],
+        K->nb[2],
+        V->nb[1],
+        V->nb[2],
+        n_kv,
+        scale);
+#else
+    GGML_UNUSED_VARS(ctx, fa_node, gate, dst);
+    GGML_ABORT(unsupported);
+#endif
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    {
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        if (fattn_1pass_d256_sm70_eligible(cc, dst, true) && (((uintptr_t) dst->data & 3) == 0)) {
+            const ggml_tensor * Q    = dst->src[0];
+            const ggml_tensor * K    = dst->src[1];
+            const ggml_tensor * V    = dst->src[2];
+            const ggml_tensor * mask = dst->src[3];
+            float scale = 1.0f;
+            memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+            const int n_head = (int) Q->ne[2];
+            const int n_kv   = (int) K->ne[1];
+            const dim3 grid(n_head, 1, 1);
+            const dim3 block(32, 16, 1);
+            k_fattn_1pass_d256_sm70<16, false><<<grid, block, 0, ctx.stream()>>>(
+                (const char *) Q->data,
+                (const char *) K->data,
+                (const char *) V->data,
+                mask ? (const half *) mask->data : nullptr,
+                nullptr,
+                (float *) dst->data,
+                Q->nb[2],
+                K->nb[1],
+                K->nb[2],
+                V->nb[1],
+                V->nb[2],
+                n_kv,
+                scale);
+            return;
+        }
+    }
+#endif
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");

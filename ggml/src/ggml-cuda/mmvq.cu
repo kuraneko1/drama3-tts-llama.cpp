@@ -1186,10 +1186,9 @@ static std::pair<dim3, dim3> calc_launch_params(
 static constexpr int MMVQ_SM70_RPB_Q4K = 4;
 static constexpr int MMVQ_SM70_RPB_Q6K = 4;
 
-static __device__ __forceinline__ float q4k_8lane_dot(
+static __device__ __forceinline__ float q4k_8lane_dot_u4(
         const block_q4_K * __restrict__ bq4,
-        const int * __restrict__ q8_0,
-        const int * __restrict__ q8_1,
+        const uint4 u0, const uint4 u1,
         const float2 ds0, const float2 ds1,
         const int j, const int h) {
     const uint4 hdr = *reinterpret_cast<const uint4 *>(bq4);
@@ -1209,15 +1208,15 @@ static __device__ __forceinline__ float q4k_8lane_dot(
 
     const uint4 v = reinterpret_cast<const uint4 *>(bq4->qs)[2 * j + h];
 
-    int dot0 = ggml_cuda_dp4a((int) (v.x & 0x0F0F0F0Fu), q8_0[0], 0);
-    dot0     = ggml_cuda_dp4a((int) (v.y & 0x0F0F0F0Fu), q8_0[1], dot0);
-    dot0     = ggml_cuda_dp4a((int) (v.z & 0x0F0F0F0Fu), q8_0[2], dot0);
-    dot0     = ggml_cuda_dp4a((int) (v.w & 0x0F0F0F0Fu), q8_0[3], dot0);
+    int dot0 = ggml_cuda_dp4a((int) (v.x & 0x0F0F0F0Fu), (int) u0.x, 0);
+    dot0     = ggml_cuda_dp4a((int) (v.y & 0x0F0F0F0Fu), (int) u0.y, dot0);
+    dot0     = ggml_cuda_dp4a((int) (v.z & 0x0F0F0F0Fu), (int) u0.z, dot0);
+    dot0     = ggml_cuda_dp4a((int) (v.w & 0x0F0F0F0Fu), (int) u0.w, dot0);
 
-    int dot1 = ggml_cuda_dp4a((int) ((v.x >> 4) & 0x0F0F0F0Fu), q8_1[0], 0);
-    dot1     = ggml_cuda_dp4a((int) ((v.y >> 4) & 0x0F0F0F0Fu), q8_1[1], dot1);
-    dot1     = ggml_cuda_dp4a((int) ((v.z >> 4) & 0x0F0F0F0Fu), q8_1[2], dot1);
-    dot1     = ggml_cuda_dp4a((int) ((v.w >> 4) & 0x0F0F0F0Fu), q8_1[3], dot1);
+    int dot1 = ggml_cuda_dp4a((int) ((v.x >> 4) & 0x0F0F0F0Fu), (int) u1.x, 0);
+    dot1     = ggml_cuda_dp4a((int) ((v.y >> 4) & 0x0F0F0F0Fu), (int) u1.y, dot1);
+    dot1     = ggml_cuda_dp4a((int) ((v.z >> 4) & 0x0F0F0F0Fu), (int) u1.z, dot1);
+    dot1     = ggml_cuda_dp4a((int) ((v.w >> 4) & 0x0F0F0F0Fu), (int) u1.w, dot1);
 
     const float2 dm = __half22float2(*reinterpret_cast<const half2 *>(&hdr.x));
     float res = dm.x * (ds0.x * (float) (dot0 * sc0) + ds1.x * (float) (dot1 * sc1));
@@ -1227,10 +1226,10 @@ static __device__ __forceinline__ float q4k_8lane_dot(
     return res;
 }
 
-template <int rows_per_cuda_block, bool use_gate, bool use_bias, int WPR = 1>
+template <int rows_per_cuda_block, bool use_gate, bool use_bias, int WPR = 1, bool planar_y = false>
 __launch_bounds__(rows_per_cuda_block * WPR * 32, 2)
 static __global__ void mul_mat_vec_q4k_sm70(
-        const void * __restrict__ vx_ptr, const void * __restrict__ vy_ptr, const int32_t * __restrict__ ids_ptr,
+        const void * __restrict__ vx_ptr, const void * __restrict__ vy_ptr, const void * __restrict__ vy_planar, const int32_t * __restrict__ ids_ptr,
         const ggml_cuda_mm_fusion_args_device fusion, float * __restrict__ dst_ptr,
         const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y,
         const uint32_t stride_row_x, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
@@ -1265,7 +1264,6 @@ static __global__ void mul_mat_vec_q4k_sm70(
     const size_t kbx_offset = (size_t) sample_x * stride_sample_x + (size_t) channel_x * stride_channel_x + (size_t) row * stride_row_x;
     const block_q4_K * __restrict__ bq4_row   = ((const block_q4_K *) vx) + kbx_offset;
     const block_q4_K * __restrict__ bgate_row = use_gate ? (((const block_q4_K *) vgate) + kbx_offset) : nullptr;
-    const block_q8_1 * __restrict__ y         = ((const block_q8_1 *) vy_ptr) + (size_t) sample_y * stride_sample_y + (size_t) channel_y * stride_channel_y;
 
     const int b4 = lane >> 3;
     const int t8 = lane & 7;
@@ -1276,19 +1274,37 @@ static __global__ void mul_mat_vec_q4k_sm70(
     float acc_gate = 0.0f;
 
     if (row < nrows_x) {
-        for (int kbx = b4 + w_id * 4; kbx < blocks_per_row_x; kbx += 4 * WPR) {
-            const block_q8_1 * __restrict__ y0 = y + kbx * 8 + 2 * j;
-            const block_q8_1 * __restrict__ y1 = y0 + 1;
-            const int * __restrict__ q8_0 = ((const int *) y0->qs) + 4 * h;
-            const int * __restrict__ q8_1 = ((const int *) y1->qs) + 4 * h;
-            const int u0[4] = { q8_0[0], q8_0[1], q8_0[2], q8_0[3] };
-            const int u1[4] = { q8_1[0], q8_1[1], q8_1[2], q8_1[3] };
-            const float2 ds0 = __half22float2(y0->ds);
-            const float2 ds1 = __half22float2(y1->ds);
+        if constexpr (planar_y) {
+            const uint4 * __restrict__ y_qs = reinterpret_cast<const uint4 *>(vy_planar);
+            const half2 * __restrict__ y_ds = reinterpret_cast<const half2 *>(reinterpret_cast<const char *>(vy_planar) + ncols_x);
+            for (int kbx = b4 + w_id * 4; kbx < blocks_per_row_x; kbx += 4 * WPR) {
+                const int    y_idx = kbx * 8 + 2 * j;
+                const uint4  u0    = y_qs[y_idx * 2 + h];
+                const uint4  u1    = y_qs[(y_idx + 1) * 2 + h];
+                const float2 ds0   = __half22float2(y_ds[y_idx]);
+                const float2 ds1   = __half22float2(y_ds[y_idx + 1]);
 
-            acc += q4k_8lane_dot(bq4_row + kbx, u0, u1, ds0, ds1, j, h);
-            if constexpr (use_gate) {
-                acc_gate += q4k_8lane_dot(bgate_row + kbx, u0, u1, ds0, ds1, j, h);
+                acc += q4k_8lane_dot_u4(bq4_row + kbx, u0, u1, ds0, ds1, j, h);
+                if constexpr (use_gate) {
+                    acc_gate += q4k_8lane_dot_u4(bgate_row + kbx, u0, u1, ds0, ds1, j, h);
+                }
+            }
+        } else {
+            const block_q8_1 * __restrict__ y = ((const block_q8_1 *) vy_ptr) + (size_t) sample_y * stride_sample_y + (size_t) channel_y * stride_channel_y;
+            for (int kbx = b4 + w_id * 4; kbx < blocks_per_row_x; kbx += 4 * WPR) {
+                const block_q8_1 * __restrict__ y0 = y + kbx * 8 + 2 * j;
+                const block_q8_1 * __restrict__ y1 = y0 + 1;
+                const int * __restrict__ q8_0 = ((const int *) y0->qs) + 4 * h;
+                const int * __restrict__ q8_1 = ((const int *) y1->qs) + 4 * h;
+                const uint4  u0  = make_uint4((uint32_t) q8_0[0], (uint32_t) q8_0[1], (uint32_t) q8_0[2], (uint32_t) q8_0[3]);
+                const uint4  u1  = make_uint4((uint32_t) q8_1[0], (uint32_t) q8_1[1], (uint32_t) q8_1[2], (uint32_t) q8_1[3]);
+                const float2 ds0 = __half22float2(y0->ds);
+                const float2 ds1 = __half22float2(y1->ds);
+
+                acc += q4k_8lane_dot_u4(bq4_row + kbx, u0, u1, ds0, ds1, j, h);
+                if constexpr (use_gate) {
+                    acc_gate += q4k_8lane_dot_u4(bgate_row + kbx, u0, u1, ds0, ds1, j, h);
+                }
             }
         }
     }
@@ -1325,10 +1341,71 @@ static __global__ void mul_mat_vec_q4k_sm70(
     }
 }
 
-template <int rows_per_cuda_block, int WPR = 1>
+template <int rows_per_cuda_block, bool use_gate, bool use_bias, int WPR>
+static void launch_mul_mat_vec_q4k_sm70(
+        const void * vx, const void * vy, const void * vy_planar, const int32_t * ids,
+        const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
+        const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y,
+        const uint32_t stride_row_x, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+        const uint32_t stride_channel_dst, const uint3 channel_ratio,
+        const uint3 sample_ratio, const uint32_t stride_sample_x, const uint32_t stride_sample_y,
+        const uint32_t stride_sample_dst, const dim3 grid, const dim3 block, cudaStream_t stream) {
+    if (vy_planar != nullptr) {
+        mul_mat_vec_q4k_sm70<rows_per_cuda_block, use_gate, use_bias, WPR, true><<<grid, block, 0, stream>>>(
+            vx, vy, vy_planar, ids, fusion, dst, ncols_x, nrows_x, nchannels_y,
+            stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
+            channel_ratio, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    } else {
+        mul_mat_vec_q4k_sm70<rows_per_cuda_block, use_gate, use_bias, WPR, false><<<grid, block, 0, stream>>>(
+            vx, vy, vy_planar, ids, fusion, dst, ncols_x, nrows_x, nchannels_y,
+            stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
+            channel_ratio, sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
+    }
+}
+
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1_planar(
+        const void * __restrict__ vbq,
+        const int * __restrict__ y_qs_i32,
+        const half2 * __restrict__ y_ds,
+        const int kbx,
+        const int iqs,
+        const int y_kbx) {
+    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
+
+    const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+    const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
+    const int vh_shift     = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+
+    int vl[VDR_Q6_K_Q8_1_MMVQ];
+    int vh[VDR_Q6_K_Q8_1_MMVQ];
+#pragma unroll
+    for (int j = 0; j < VDR_Q6_K_Q8_1_MMVQ; ++j) {
+        vl[j] = get_int_b2(bq6_K->ql, iqs + j);
+        vh[j] = get_int_b2(bq6_K->qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4) + j) >> vh_shift;
+    }
+
+    const int8_t * scales = bq6_K->scales + scale_offset;
+
+    int   u[VDR_Q6_K_Q8_1_MMVQ * QR6_K];
+    float d8[QR6_K];
+    const int qs_pair = (iqs & (QI8_1 - 1)) >> 1;
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        const int   y_blk = y_kbx * 8 + bq8_offset + 2 * i;
+        const uint2 u2    = reinterpret_cast<const uint2 *>(y_qs_i32 + y_blk * 8)[qs_pair];
+        u[VDR_Q6_K_Q8_1_MMVQ * i + 0] = (int) u2.x;
+        u[VDR_Q6_K_Q8_1_MMVQ * i + 1] = (int) u2.y;
+        d8[i] = __low2float(y_ds[y_blk]);
+    }
+
+    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+}
+
+template <int rows_per_cuda_block, int WPR = 1, bool planar_y = false>
 __launch_bounds__(rows_per_cuda_block * WPR * 32, 2)
 static __global__ void mul_mat_vec_q6k_sm70(
-        const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
+        const void * __restrict__ vx, const void * __restrict__ vy, const void * __restrict__ vy_planar, const int32_t * __restrict__ ids,
         float * __restrict__ dst,
         const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y,
         const uint32_t stride_row_x, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
@@ -1353,15 +1430,22 @@ static __global__ void mul_mat_vec_q6k_sm70(
 
     const int blocks_per_row_x = (int) (ncols_x / QK_K);
     const int kbx_offset = (int) ((size_t) sample_x * stride_sample_x + (size_t) channel_x * stride_channel_x + (size_t) row * stride_row_x);
-    const block_q8_1 * __restrict__ y = ((const block_q8_1 *) vy) + (size_t) sample_y * stride_sample_y + (size_t) channel_y * stride_channel_y;
-
     const int half_w = lane >> 4;
     const int t16    = lane & 15;
     const int iqs    = t16 * 2;
     float acc = 0.0f;
     if (row < nrows_x) {
-        for (int kbx = half_w + w_id * 2; kbx < blocks_per_row_x; kbx += 2 * WPR) {
-            acc += vec_dot_q6_K_q8_1(vx, &y[kbx * (QK_K / QK8_1)], kbx_offset + kbx, iqs);
+        if constexpr (planar_y) {
+            const int * __restrict__ y_qs_i32 = reinterpret_cast<const int *>(vy_planar);
+            const half2 * __restrict__ y_ds   = reinterpret_cast<const half2 *>(reinterpret_cast<const char *>(vy_planar) + ncols_x);
+            for (int kbx = half_w + w_id * 2; kbx < blocks_per_row_x; kbx += 2 * WPR) {
+                acc += vec_dot_q6_K_q8_1_planar(vx, y_qs_i32, y_ds, kbx_offset + kbx, iqs, kbx);
+            }
+        } else {
+            const block_q8_1 * __restrict__ y = ((const block_q8_1 *) vy) + (size_t) sample_y * stride_sample_y + (size_t) channel_y * stride_channel_y;
+            for (int kbx = half_w + w_id * 2; kbx < blocks_per_row_x; kbx += 2 * WPR) {
+                acc += vec_dot_q6_K_q8_1(vx, &y[kbx * (QK_K / QK8_1)], kbx_offset + kbx, iqs);
+            }
         }
     }
     acc = warp_reduce_sum<32>(acc);
@@ -1404,7 +1488,8 @@ static __global__ void mul_mat_vec_q4k_k512_f32_shared(
         const uint32_t stride_channel_x,
         const uint32_t stride_channel_y_routed,
         const uint32_t stride_channel_dst_routed) {
-    __shared__ block_q8_1 s_y[16];
+    __shared__ uint4 s_yqs[32];
+    __shared__ half2 s_yds[16];
 
     const bool is_shared = (blockIdx.y == nchannels_routed);
     const float * __restrict__ y_f32 = is_shared
@@ -1432,14 +1517,14 @@ static __global__ void mul_mat_vec_q4k_k512_f32_shared(
         (((uint32_t) (uint8_t) (int8_t) q1) << 8) |
         (((uint32_t) (uint8_t) (int8_t) q2) << 16) |
         (((uint32_t) (uint8_t) (int8_t) q3) << 24);
-    reinterpret_cast<uint32_t *>(s_y[blk].qs)[lane8] = packed;
+    reinterpret_cast<uint32_t *>(s_yqs)[blk * 8 + lane8] = packed;
 
     int sum_q = q0 + q1 + q2 + q3;
     sum_q += __shfl_xor_sync(0xffffffff, sum_q, 4);
     sum_q += __shfl_xor_sync(0xffffffff, sum_q, 2);
     sum_q += __shfl_xor_sync(0xffffffff, sum_q, 1);
     if (lane8 == 0) {
-        s_y[blk].ds = make_half2(d, d * sum_q);
+        s_yds[blk] = make_half2(d, d * sum_q);
     }
     __syncthreads();
 
@@ -1459,21 +1544,18 @@ static __global__ void mul_mat_vec_q4k_k512_f32_shared(
     const int j      = t8 >> 1;
     const int h      = t8 & 1;
 
-    const block_q8_1 * __restrict__ y0 = &s_y[b2 * 8 + 2 * j];
-    const block_q8_1 * __restrict__ y1 = y0 + 1;
-    const int * __restrict__ q8_0 = reinterpret_cast<const int *>(y0->qs) + 4 * h;
-    const int * __restrict__ q8_1 = reinterpret_cast<const int *>(y1->qs) + 4 * h;
-    const int u0[4] = { q8_0[0], q8_0[1], q8_0[2], q8_0[3] };
-    const int u1[4] = { q8_1[0], q8_1[1], q8_1[2], q8_1[3] };
-    const float2 ds0 = __half22float2(y0->ds);
-    const float2 ds1 = __half22float2(y1->ds);
+    const int    y_idx = b2 * 8 + 2 * j;
+    const uint4  u0    = s_yqs[y_idx * 2 + h];
+    const uint4  u1    = s_yqs[(y_idx + 1) * 2 + h];
+    const float2 ds0   = __half22float2(s_yds[y_idx]);
+    const float2 ds1   = __half22float2(s_yds[y_idx + 1]);
 
     const uint32_t warp_base = blockIdx.x * (rows_per_warp * 4) + threadIdx.y * rows_per_warp;
 #pragma unroll
     for (int p = 0; p < rows_per_warp / 2; ++p) {
         const uint32_t row = warp_base + p * 2 + r_half;
         float acc = (row < nrows_x)
-            ? q4k_8lane_dot(bq4_base + (size_t) row * stride_row_x + b2, u0, u1, ds0, ds1, j, h)
+            ? q4k_8lane_dot_u4(bq4_base + (size_t) row * stride_row_x + b2, u0, u1, ds0, ds1, j, h)
             : 0.0f;
         acc += __shfl_xor_sync(0xffffffff, acc, 8, 16);
         acc += __shfl_xor_sync(0xffffffff, acc, 4, 16);
@@ -1501,7 +1583,8 @@ static __global__ void mul_mat_vec_q6k_k512_f32_shared(
         const uint32_t stride_channel_x,
         const uint32_t stride_channel_y_routed,
         const uint32_t stride_channel_dst_routed) {
-    __shared__ block_q8_1 s_y[16];
+    __shared__ int   s_yqs[128];
+    __shared__ half2 s_yds[16];
 
     const bool is_shared = (blockIdx.y == nchannels_routed);
     const float * __restrict__ y_f32 = is_shared
@@ -1529,14 +1612,14 @@ static __global__ void mul_mat_vec_q6k_k512_f32_shared(
         (((uint32_t) (uint8_t) (int8_t) q1) << 8) |
         (((uint32_t) (uint8_t) (int8_t) q2) << 16) |
         (((uint32_t) (uint8_t) (int8_t) q3) << 24);
-    reinterpret_cast<uint32_t *>(s_y[blk].qs)[lane8] = packed;
+    s_yqs[blk * 8 + lane8] = (int) packed;
 
     int sum_q = q0 + q1 + q2 + q3;
     sum_q += __shfl_xor_sync(0xffffffff, sum_q, 4);
     sum_q += __shfl_xor_sync(0xffffffff, sum_q, 2);
     sum_q += __shfl_xor_sync(0xffffffff, sum_q, 1);
     if (lane8 == 0) {
-        s_y[blk].ds = make_half2(d, d * sum_q);
+        s_yds[blk] = make_half2(d, d * sum_q);
     }
     __syncthreads();
 
@@ -1557,7 +1640,7 @@ static __global__ void mul_mat_vec_q6k_k512_f32_shared(
     for (int r_idx = 0; r_idx < rows_per_warp; ++r_idx) {
         const uint32_t row = warp_base + r_idx;
         float acc = (row < nrows_x)
-            ? vec_dot_q6_K_q8_1(vx, &s_y[half_w * 8], (int) (base_kbx + (size_t) row * stride_row_x + half_w), iqs)
+            ? vec_dot_q6_K_q8_1_planar(vx, s_yqs, s_yds, (int) (base_kbx + (size_t) row * stride_row_x + half_w), iqs, half_w)
             : 0.0f;
         acc = warp_reduce_sum<32>(acc);
         if (lane == 0 && row < nrows_x) {
@@ -1639,7 +1722,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, cudaStream_t stream) {
+        const int ids_stride, cudaStream_t stream, const void * vy_planar = nullptr) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
@@ -1765,47 +1848,50 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     (!fusion.gate || (((uintptr_t) fusion.gate & 15) == 0)) &&
                     (!fusion.shared_up || ((((uintptr_t) fusion.shared_up & 15) == 0) && (((uintptr_t) fusion.shared_gate & 15) == 0)));
                 if (ok_sm70) {
+                    const void * yp = (!use_gate && vy_planar != nullptr && nchannels_y == 1 && nsamples_dst == 1 &&
+                                       (ncols_x % 256 == 0) && (((uintptr_t) vy_planar & 15) == 0))
+                                    ? vy_planar : nullptr;
                     const int nblocks = (nrows_x + MMVQ_SM70_RPB_Q4K - 1) / MMVQ_SM70_RPB_Q4K;
                     if (!use_gate && !fusion.shared_up && nrows_x <= 2048 && ncols_x >= 4096 &&
                             nchannels_dst == 1 && nsamples_dst == 1 && ncols_x % (4 * 2 * QK_K) == 0) {
                         const dim3 grid(nblocks, 1, 1);
                         const dim3 block(warp_size, MMVQ_SM70_RPB_Q4K * 2, 1);
                         if (use_bias) {
-                            mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, false, true, 2><<<grid, block, 0, stream>>>(
-                                vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
+                            launch_mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, false, true, 2>(
+                                vx, vy, yp, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
                                 stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, grid, block, stream);
                         } else {
-                            mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, false, false, 2><<<grid, block, 0, stream>>>(
-                                vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
+                            launch_mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, false, false, 2>(
+                                vx, vy, yp, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
                                 stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, grid, block, stream);
                         }
                     } else {
                         const dim3 grid(nblocks, nchannels_dst + (fusion.shared_up != nullptr), nsamples_dst);
                         const dim3 block(warp_size, MMVQ_SM70_RPB_Q4K, 1);
                         if (use_gate) {
                             if (use_bias) {
-                                mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, true, true, 1><<<grid, block, 0, stream>>>(
-                                    vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
+                                launch_mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, true, true, 1>(
+                                    vx, vy, yp, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
                                     stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                    channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                                    channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, grid, block, stream);
                             } else {
-                                mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, true, false, 1><<<grid, block, 0, stream>>>(
-                                    vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
+                                launch_mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, true, false, 1>(
+                                    vx, vy, yp, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
                                     stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                    channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                                    channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, grid, block, stream);
                             }
                         } else if (use_bias) {
-                            mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, false, true, 1><<<grid, block, 0, stream>>>(
-                                vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
+                            launch_mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, false, true, 1>(
+                                vx, vy, yp, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
                                 stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, grid, block, stream);
                         } else {
-                            mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, false, false, 1><<<grid, block, 0, stream>>>(
-                                vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
+                            launch_mul_mat_vec_q4k_sm70<MMVQ_SM70_RPB_Q4K, false, false, 1>(
+                                vx, vy, yp, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd,
                                 stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
-                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, grid, block, stream);
                         }
                     }
                     break;
@@ -1815,24 +1901,41 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 const bool use_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                                         fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
                 if (cc == GGML_CUDA_CC_VOLTA && !use_fusion) {
+                    const void * yp = (vy_planar != nullptr && nchannels_y == 1 && nsamples_dst == 1 &&
+                                       (ncols_x % 256 == 0) && (((uintptr_t) vy_planar & 15) == 0))
+                                    ? vy_planar : nullptr;
                     if (nrows_x <= 512 && ncols_x >= 2048 && nchannels_dst == 1 && nsamples_dst == 1 &&
                             ncols_x % (2 * 4 * QK_K) == 0) {
                         constexpr int RPB_SMALL = 2;
                         const int nblocks = (nrows_x + RPB_SMALL - 1) / RPB_SMALL;
                         const dim3 grid(nblocks, 1, 1);
                         const dim3 block(warp_size, RPB_SMALL * 4, 1);
-                        mul_mat_vec_q6k_sm70<RPB_SMALL, 4><<<grid, block, 0, stream>>>(
-                            vx, vy, ids, dst, ncols_x, nrows_x, nchannels_y_fd,
-                            stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
-                            channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                        if (yp != nullptr) {
+                            mul_mat_vec_q6k_sm70<RPB_SMALL, 4, true><<<grid, block, 0, stream>>>(
+                                vx, vy, yp, ids, dst, ncols_x, nrows_x, nchannels_y_fd,
+                                stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
+                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                        } else {
+                            mul_mat_vec_q6k_sm70<RPB_SMALL, 4, false><<<grid, block, 0, stream>>>(
+                                vx, vy, nullptr, ids, dst, ncols_x, nrows_x, nchannels_y_fd,
+                                stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
+                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                        }
                     } else {
                         const int nblocks = (nrows_x + MMVQ_SM70_RPB_Q6K - 1) / MMVQ_SM70_RPB_Q6K;
                         const dim3 grid(nblocks, nchannels_dst, nsamples_dst);
                         const dim3 block(warp_size, MMVQ_SM70_RPB_Q6K, 1);
-                        mul_mat_vec_q6k_sm70<MMVQ_SM70_RPB_Q6K, 1><<<grid, block, 0, stream>>>(
-                            vx, vy, ids, dst, ncols_x, nrows_x, nchannels_y_fd,
-                            stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
-                            channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                        if (yp != nullptr) {
+                            mul_mat_vec_q6k_sm70<MMVQ_SM70_RPB_Q6K, 1, true><<<grid, block, 0, stream>>>(
+                                vx, vy, yp, ids, dst, ncols_x, nrows_x, nchannels_y_fd,
+                                stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
+                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                        } else {
+                            mul_mat_vec_q6k_sm70<MMVQ_SM70_RPB_Q6K, 1, false><<<grid, block, 0, stream>>>(
+                                vx, vy, nullptr, ids, dst, ncols_x, nrows_x, nchannels_y_fd,
+                                stride_row_x, stride_channel_x, stride_channel_y, stride_channel_dst,
+                                channel_ratio_fd, sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst);
+                        }
                     }
                     break;
                 }
@@ -1913,7 +2016,7 @@ static void mul_mat_vec_q_switch_type(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, cudaStream_t stream) {
+        const int ids_stride, cudaStream_t stream, const void * vy_planar = nullptr) {
     switch (type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
@@ -1985,7 +2088,7 @@ static void mul_mat_vec_q_switch_type(
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, vy_planar);
             break;
         case GGML_TYPE_Q5_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_K>
@@ -1997,7 +2100,7 @@ static void mul_mat_vec_q_switch_type(
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q6_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, vy_planar);
             break;
         case GGML_TYPE_IQ2_XXS:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_XXS>
@@ -2157,7 +2260,8 @@ void ggml_cuda_mul_mat_vec_q(
     const size_t q8_1_bytes   = (size_t) ne13 * ne12 * ne11 * ne10_padded * sizeof(block_q8_1) / QK8_1;
     const size_t aligned_bytes = (q8_1_bytes + 255) & ~size_t(255);
     ggml_cuda_pool_alloc<char> src1_q8_1_fallback(ctx.pool());
-    const char * src1_q8_1_ptr = nullptr;
+    const char * src1_q8_1_ptr    = nullptr;
+    const char * src1_q8_planar_ptr = nullptr;
     {
         const int64_t s11_in = src1->nb[1] / ts_src1;
         const int64_t s12_in = src1->nb[2] / ts_src1;
@@ -2169,7 +2273,8 @@ void ggml_cuda_mul_mat_vec_q(
                 if (e.src_data == src1->data && e.src_type == src1->type &&
                         e.ne10 == ne10 && e.ne11 == ne11 && e.ne12 == ne12 && e.ne13 == ne13 &&
                         e.s11 == s11_in && e.s12 == s12_in && e.s13 == s13_in) {
-                    src1_q8_1_ptr = e.q8_1_ptr;
+                    src1_q8_1_ptr      = e.q8_1_ptr;
+                    src1_q8_planar_ptr = (ne11 == 1 && ne12 == 1 && ne13 == 1) ? e.q8_planar_ptr : nullptr;
                     cache_hit = true;
                     break;
                 }
@@ -2223,7 +2328,8 @@ void ggml_cuda_mul_mat_vec_q(
         src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream,
+        src1_q8_planar_ptr);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

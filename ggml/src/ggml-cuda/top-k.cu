@@ -397,8 +397,6 @@ static __global__ void k_fused_top_k_top_p_sample_f32(
     __shared__ float s_warp_val[N_WARPS];
     __shared__ int   s_warp_idx[N_WARPS];
     __shared__ int   s_win_idx;
-    __shared__ float s_work[MAX_K];
-    __shared__ float s_keep[MAX_K];
 
     const int tid  = threadIdx.x;
     const int warp = tid >> 5;
@@ -416,27 +414,44 @@ static __global__ void k_fused_top_k_top_p_sample_f32(
         }
     }
 
-    // Step 1: exact lower bound t_lb = k-th largest thread maximum via descending bitonic sort
-    s_tmax[tid] = my_max;
-    for (int size = 2; size <= BLOCK_SIZE; size <<= 1) {
-        const bool inter_warp = (size >= 64);
-        for (int stride = size >> 1; stride > 0; stride >>= 1) {
-            if (inter_warp && stride >= 16) {
-                __syncthreads();
-            } else {
-                __syncwarp();
+    // Step 1: exact lower bound t_lb = k-th largest thread maximum via register-shuffle + shared bitonic sort
+    {
+        float tmax_reg = my_max;
+#pragma unroll
+        for (int size = 2; size <= 32; size <<= 1) {
+            const bool want_desc = (tid & size) == 0;
+#pragma unroll
+            for (int stride = size >> 1; stride > 0; stride >>= 1) {
+                const float o = __shfl_xor_sync(0xffffffff, tmax_reg, stride);
+                const bool lower = (lane & stride) == 0;
+                tmax_reg = (lower == want_desc) ? fmaxf(tmax_reg, o) : fminf(tmax_reg, o);
             }
+        }
+        s_tmax[tid] = tmax_reg;
+    }
+    for (int size = 64; size <= BLOCK_SIZE; size <<= 1) {
+        const bool want_desc = (tid & size) == 0;
+        for (int stride = size >> 1; stride >= 32; stride >>= 1) {
+            __syncthreads();
             const int ixj = tid ^ stride;
             if (ixj > tid) {
                 const float a = s_tmax[tid];
                 const float b = s_tmax[ixj];
-                const bool want_desc = (tid & size) == 0;
                 if (want_desc ? (a < b) : (a > b)) {
                     s_tmax[tid] = b;
                     s_tmax[ixj] = a;
                 }
             }
         }
+        __syncthreads();
+        float v_reg = s_tmax[tid];
+#pragma unroll
+        for (int stride = 16; stride > 0; stride >>= 1) {
+            const float o = __shfl_xor_sync(0xffffffff, v_reg, stride);
+            const bool lower = (lane & stride) == 0;
+            v_reg = (lower == want_desc) ? fmaxf(v_reg, o) : fminf(v_reg, o);
+        }
+        s_tmax[tid] = v_reg;
     }
     __syncthreads();
     const float t_lb = s_tmax[k - 1];
@@ -503,29 +518,84 @@ static __global__ void k_fused_top_k_top_p_sample_f32(
             }
         }
 
-        for (int size = 2; size <= P; size <<= 1) {
-            const bool inter_warp = (size >= 64);
-            for (int stride = size >> 1; stride > 0; stride >>= 1) {
-                if (inter_warp && stride >= 16) {
-                    __syncthreads();
-                } else {
-                    __syncwarp();
+        __syncthreads();
+        if (P >= 32) {
+            if (tid < P) {
+                float v_reg = s_cval[tid];
+                int   i_reg = s_cidx[tid];
+#pragma unroll
+                for (int size = 2; size <= 32; size <<= 1) {
+                    const bool want_desc = (tid & size) == 0;
+#pragma unroll
+                    for (int stride = size >> 1; stride > 0; stride >>= 1) {
+                        const float ov = __shfl_xor_sync(0xffffffff, v_reg, stride);
+                        const int   oi = __shfl_xor_sync(0xffffffff, i_reg, stride);
+                        const bool lower = (lane & stride) == 0;
+                        if (topk_cand_better(ov, oi, v_reg, i_reg) == (lower == want_desc)) {
+                            v_reg = ov;
+                            i_reg = oi;
+                        }
+                    }
                 }
+                s_cval[tid] = v_reg;
+                s_cidx[tid] = i_reg;
+            }
+            for (int size = 64; size <= P; size <<= 1) {
+                const bool want_desc = (tid & size) == 0;
+                for (int stride = size >> 1; stride >= 32; stride >>= 1) {
+                    __syncthreads();
+                    if (tid < P) {
+                        const int ixj = tid ^ stride;
+                        if (ixj > tid) {
+                            const float va = s_cval[tid];
+                            const int   ia = s_cidx[tid];
+                            const float vb = s_cval[ixj];
+                            const int   ib = s_cidx[ixj];
+                            if (want_desc ? !topk_cand_better(va, ia, vb, ib) : topk_cand_better(va, ia, vb, ib)) {
+                                s_cval[tid] = vb;
+                                s_cidx[tid] = ib;
+                                s_cval[ixj] = va;
+                                s_cidx[ixj] = ia;
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
                 if (tid < P) {
-                    const int ixj = tid ^ stride;
-                    if (ixj > tid) {
-                        const float va = s_cval[tid];
-                        const int   ia = s_cidx[tid];
-                        const float vb = s_cval[ixj];
-                        const int   ib = s_cidx[ixj];
-                        const bool want_desc = (tid & size) == 0;
-                        const bool swap = want_desc ? !topk_cand_better(va, ia, vb, ib)
-                                                    :  topk_cand_better(va, ia, vb, ib);
-                        if (swap) {
-                            s_cval[tid] = vb;
-                            s_cidx[tid] = ib;
-                            s_cval[ixj] = va;
-                            s_cidx[ixj] = ia;
+                    float v_reg = s_cval[tid];
+                    int   i_reg = s_cidx[tid];
+#pragma unroll
+                    for (int stride = 16; stride > 0; stride >>= 1) {
+                        const float ov = __shfl_xor_sync(0xffffffff, v_reg, stride);
+                        const int   oi = __shfl_xor_sync(0xffffffff, i_reg, stride);
+                        const bool lower = (lane & stride) == 0;
+                        if (topk_cand_better(ov, oi, v_reg, i_reg) == (lower == want_desc)) {
+                            v_reg = ov;
+                            i_reg = oi;
+                        }
+                    }
+                    s_cval[tid] = v_reg;
+                    s_cidx[tid] = i_reg;
+                }
+            }
+        } else {
+            for (int size = 2; size <= P; size <<= 1) {
+                for (int stride = size >> 1; stride > 0; stride >>= 1) {
+                    __syncwarp();
+                    if (tid < P) {
+                        const int ixj = tid ^ stride;
+                        if (ixj > tid) {
+                            const float va = s_cval[tid];
+                            const int   ia = s_cidx[tid];
+                            const float vb = s_cval[ixj];
+                            const int   ib = s_cidx[ixj];
+                            const bool want_desc = (tid & size) == 0;
+                            if (want_desc ? !topk_cand_better(va, ia, vb, ib) : topk_cand_better(va, ia, vb, ib)) {
+                                s_cval[tid] = vb;
+                                s_cidx[tid] = ib;
+                                s_cval[ixj] = va;
+                                s_cidx[ixj] = ia;
+                            }
                         }
                     }
                 }
@@ -610,116 +680,102 @@ static __global__ void k_fused_top_k_top_p_sample_f32(
         __syncthreads();
     }
 
-    if (k <= 32) {
-        if (warp == 0) {
-            const bool active = lane < k;
-            const float val   = active ? s_cval[lane] : -INFINITY;
-            const float max_v1 = s_cval[0];
-            const float e1     = active ? expf(val - max_v1) : 0.0f;
-
-            float sum_e1 = e1;
-#pragma unroll
-            for (int m = 16; m > 0; m >>= 1) {
-                sum_e1 += __shfl_xor_sync(0xffffffff, sum_e1, m);
-            }
-            const float p1 = e1 / sum_e1;
-
-            float cdf1 = p1;
-#pragma unroll
-            for (int d = 1; d < 32; d <<= 1) {
-                const float n = __shfl_up_sync(0xffffffff, cdf1, d);
-                if (lane >= d) {
-                    cdf1 += n;
-                }
-            }
-
-            int keep = (active && (top_p - cdf1 > 0.0f)) ? 1 : 0;
-            int sum_keep = keep;
-#pragma unroll
-            for (int m = 16; m > 0; m >>= 1) {
-                sum_keep += __shfl_xor_sync(0xffffffff, sum_keep, m);
-            }
-            const int force_idx = min(max(sum_keep, 0), k - 1);
-            if (lane == force_idx) {
-                keep = 1;
-            }
-
-            float max_v2 = keep ? val : -INFINITY;
-#pragma unroll
-            for (int m = 16; m > 0; m >>= 1) {
-                max_v2 = fmaxf(max_v2, __shfl_xor_sync(0xffffffff, max_v2, m));
-            }
-
-            const float e2 = keep ? expf(val - max_v2) : 0.0f;
-            float sum_e2 = e2;
-#pragma unroll
-            for (int m = 16; m > 0; m >>= 1) {
-                sum_e2 += __shfl_xor_sync(0xffffffff, sum_e2, m);
-            }
-            const float p2 = e2 / sum_e2;
-
-            float cdf2 = p2;
-#pragma unroll
-            for (int d = 1; d < 32; d <<= 1) {
-                const float n = __shfl_up_sync(0xffffffff, cdf2, d);
-                if (lane >= d) {
-                    cdf2 += n;
-                }
-            }
-
-            const float r = *rand_ptr;
-            int cross = (active && (cdf2 - r > 0.0f)) ? 1 : 0;
-#pragma unroll
-            for (int m = 16; m > 0; m >>= 1) {
-                cross += __shfl_xor_sync(0xffffffff, cross, m);
-            }
-            const int draw_pos = min(max(k - cross, 0), k - 1);
-            if (lane == 0) {
-                *dst = s_cidx[draw_pos];
-            }
-        }
-    } else if (tid == 0) {
+    if (warp == 0) {
+        const int  idx0 = lane;
+        const int  idx1 = lane + 32;
+        const bool a0   = (idx0 < k);
+        const bool a1   = (idx1 < k);
+        const float v0  = a0 ? s_cval[idx0] : -INFINITY;
+        const float v1  = a1 ? s_cval[idx1] : -INFINITY;
         const float max_v1 = s_cval[0];
-        float sum_e1 = 0.0f;
-        for (int j = 0; j < k; ++j) {
-            const float e = expf(s_cval[j] - max_v1);
-            s_work[j] = e;
-            sum_e1 += e;
+
+        const float e1_0 = a0 ? expf(v0 - max_v1) : 0.0f;
+        const float e1_1 = a1 ? expf(v1 - max_v1) : 0.0f;
+        float sum_e1 = e1_0 + e1_1;
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            sum_e1 += __shfl_xor_sync(0xffffffff, sum_e1, m);
         }
         const float inv_s1 = 1.0f / sum_e1;
-        float cdf1     = 0.0f;
-        float sum_keep = 0.0f;
-        for (int j = 0; j < k; ++j) {
-            cdf1 += s_work[j] * inv_s1;
-            const float km = (top_p - cdf1 > 0.0f) ? 1.0f : 0.0f;
-            s_keep[j]  = km;
-            sum_keep  += km;
-        }
-        const int force_idx = (int) fminf(fmaxf(sum_keep, 0.0f), (float) (k - 1));
-        s_keep[force_idx] = 1.0f;
+        const float p1_0 = e1_0 * inv_s1;
+        const float p1_1 = e1_1 * inv_s1;
 
-        float max_v2 = -INFINITY;
-        for (int j = 0; j < k; ++j) {
-            if (s_keep[j] > 0.0f && s_cval[j] > max_v2) {
-                max_v2 = s_cval[j];
+        float cdf1_0 = p1_0;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const float n = __shfl_up_sync(0xffffffff, cdf1_0, d);
+            if (lane >= d) {
+                cdf1_0 += n;
             }
         }
-        float sum_e2 = 0.0f;
-        for (int j = 0; j < k; ++j) {
-            const float e = (s_keep[j] > 0.0f) ? expf(s_cval[j] - max_v2) : 0.0f;
-            s_work[j] = e;
-            sum_e2 += e;
+        const float base_cdf1 = __shfl_sync(0xffffffff, cdf1_0, 31);
+        float cdf1_1 = p1_1;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const float n = __shfl_up_sync(0xffffffff, cdf1_1, d);
+            if (lane >= d) {
+                cdf1_1 += n;
+            }
+        }
+        cdf1_1 += base_cdf1;
+
+        int keep0 = (a0 && (top_p - cdf1_0 > 0.0f)) ? 1 : 0;
+        int keep1 = (a1 && (top_p - cdf1_1 > 0.0f)) ? 1 : 0;
+        int sum_keep = keep0 + keep1;
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            sum_keep += __shfl_xor_sync(0xffffffff, sum_keep, m);
+        }
+        const int force_idx = min(max(sum_keep, 0), k - 1);
+        if (idx0 == force_idx) keep0 = 1;
+        if (idx1 == force_idx) keep1 = 1;
+
+        float max_v2 = fmaxf(keep0 ? v0 : -INFINITY, keep1 ? v1 : -INFINITY);
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            max_v2 = fmaxf(max_v2, __shfl_xor_sync(0xffffffff, max_v2, m));
+        }
+
+        const float e2_0 = keep0 ? expf(v0 - max_v2) : 0.0f;
+        const float e2_1 = keep1 ? expf(v1 - max_v2) : 0.0f;
+        float sum_e2 = e2_0 + e2_1;
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            sum_e2 += __shfl_xor_sync(0xffffffff, sum_e2, m);
         }
         const float inv_s2 = 1.0f / sum_e2;
-        const float r = *rand_ptr;
-        float cdf2      = 0.0f;
-        float sum_cross = 0.0f;
-        for (int j = 0; j < k; ++j) {
-            cdf2 += s_work[j] * inv_s2;
-            sum_cross += (cdf2 - r > 0.0f) ? 1.0f : 0.0f;
+        const float p2_0 = e2_0 * inv_s2;
+        const float p2_1 = e2_1 * inv_s2;
+
+        float cdf2_0 = p2_0;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const float n = __shfl_up_sync(0xffffffff, cdf2_0, d);
+            if (lane >= d) {
+                cdf2_0 += n;
+            }
         }
-        const int draw_pos = (int) fminf(fmaxf((float) k - sum_cross, 0.0f), (float) (k - 1));
-        *dst = s_cidx[draw_pos];
+        const float base_cdf2 = __shfl_sync(0xffffffff, cdf2_0, 31);
+        float cdf2_1 = p2_1;
+#pragma unroll
+        for (int d = 1; d < 32; d <<= 1) {
+            const float n = __shfl_up_sync(0xffffffff, cdf2_1, d);
+            if (lane >= d) {
+                cdf2_1 += n;
+            }
+        }
+        cdf2_1 += base_cdf2;
+
+        const float r = *rand_ptr;
+        int cross = ((a0 && (cdf2_0 - r > 0.0f)) ? 1 : 0) + ((a1 && (cdf2_1 - r > 0.0f)) ? 1 : 0);
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            cross += __shfl_xor_sync(0xffffffff, cross, m);
+        }
+        const int draw_pos = min(max(k - cross, 0), k - 1);
+        if (lane == 0) {
+            *dst = s_cidx[draw_pos];
+        }
     }
 }
 

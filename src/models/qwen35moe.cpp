@@ -307,6 +307,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
             Vcur = ggml_view_2d(ctx0, qk, n_v, 1, qk->nb[1], (size_t) (n_q + n_k) * qk->nb[0]);
         } else {
             Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+            ggml_build_forward_expand(gf, Vcur);
         }
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);

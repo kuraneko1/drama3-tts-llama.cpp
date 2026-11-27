@@ -1507,6 +1507,7 @@ struct ggml_backend_cuda_context {
         int64_t      ne10, ne11, ne12, ne13;
         int64_t      s11, s12, s13;
         char *       q8_1_ptr;
+        char *       q8_planar_ptr = nullptr;
     };
 
     void *  q8_1_cache_buf  = nullptr;

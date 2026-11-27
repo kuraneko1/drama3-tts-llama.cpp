@@ -871,6 +871,8 @@ static __global__ void rms_norm_mul_q8_1_2048_f32(
         const float * __restrict__ mul,
         float * __restrict__       dst,
         block_q8_1 * __restrict__  q8,
+        uint32_t * __restrict__    q8_p_qs,
+        half2 * __restrict__       q8_p_ds,
         const float                eps) {
     const int tid   = threadIdx.x;
     const int lane8 = tid & 7;
@@ -909,13 +911,20 @@ static __global__ void rms_norm_mul_q8_1_2048_f32(
         (((uint32_t) (uint8_t) (int8_t) q2) << 16) |
         (((uint32_t) (uint8_t) (int8_t) q3) << 24);
     ((uint32_t *) q8[blk].qs)[lane8] = packed;
+    if (q8_p_qs != nullptr) {
+        q8_p_qs[blk * 8 + lane8] = packed;
+    }
 
     int sum_q = q0 + q1 + q2 + q3;
     sum_q += __shfl_xor_sync(0xffffffff, sum_q, 4);
     sum_q += __shfl_xor_sync(0xffffffff, sum_q, 2);
     sum_q += __shfl_xor_sync(0xffffffff, sum_q, 1);
     if (lane8 == 0) {
-        q8[blk].ds = make_half2(d, d * sum_q);
+        const half2 dsh = make_half2(d, d * sum_q);
+        q8[blk].ds = dsh;
+        if (q8_p_ds != nullptr) {
+            q8_p_ds[blk] = dsh;
+        }
     }
 }
 #endif
@@ -984,19 +993,24 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
         constexpr int64_t ne10_padded = GGML_PAD(2048, MATRIX_ROW_PADDING);
         constexpr size_t  q8_1_bytes  = (size_t) ne10_padded * sizeof(block_q8_1) / QK8_1;
         constexpr size_t  aligned_b   = (q8_1_bytes + 255) & ~size_t(255);
-        if (ctx.q8_1_cache_used + aligned_b <= ctx.q8_1_cache_cap) {
+        constexpr size_t  planar_b    = 2048 + (2048 / 32) * sizeof(half2);
+        constexpr size_t  aligned_p   = (planar_b + 255) & ~size_t(255);
+        if (ctx.q8_1_cache_used + aligned_b + aligned_p <= ctx.q8_1_cache_cap) {
             ctx.q8_1_cache_invalidate_range(mul_tensor->data, ggml_nbytes(mul_tensor));
-            char * dst_q8 = (char *) ctx.q8_1_cache_buf + ctx.q8_1_cache_used;
-            ctx.q8_1_cache_used += aligned_b;
+            char * dst_q8   = (char *) ctx.q8_1_cache_buf + ctx.q8_1_cache_used;
+            char * dst_q8_p = dst_q8 + aligned_b;
+            ctx.q8_1_cache_used += aligned_b + aligned_p;
             ctx.q8_1_cache.push_back({
                 mul_tensor->data, ggml_nbytes(mul_tensor), GGML_TYPE_F32,
-                2048, 1, 1, 1, 2048, 2048, 2048, dst_q8
+                2048, 1, 1, 1, 2048, 2048, 2048, dst_q8, dst_q8_p
             });
             rms_norm_mul_q8_1_2048_f32<512><<<1, 512, 0, stream>>>(
                 (const float *) rms_norm_src->data,
                 (const float *) mul_src->data,
                 (float *)       mul_tensor->data,
                 (block_q8_1 *)  dst_q8,
+                (uint32_t *)    dst_q8_p,
+                (half2 *)       (dst_q8_p + 2048),
                 eps);
             return;
         }
@@ -1157,6 +1171,8 @@ static __global__ void rms_norm_mul_silu_q8_1_128_f32(
         const float * __restrict__ z,
         float * __restrict__       dst,
         block_q8_1 * __restrict__  q8,
+        int8_t * __restrict__      q8_p_qs,
+        half2 * __restrict__       q8_p_ds,
         const float                eps) {
     const int head = blockIdx.x;
     const int tid  = threadIdx.x;
@@ -1184,9 +1200,16 @@ static __global__ void rms_norm_mul_silu_q8_1_128_f32(
         const float d    = amax / 127.0f;
         const int   q    = (amax == 0.0f) ? 0 : (int) roundf(val / d);
         q8[blk].qs[lane] = (int8_t) q;
+        if (q8_p_qs != nullptr) {
+            q8_p_qs[blk * 32 + lane] = (int8_t) q;
+        }
         const int sum_q  = warp_reduce_sum<32>(q);
         if (lane == 0) {
-            q8[blk].ds = make_half2(d, d * sum_q);
+            const half2 dsh = make_half2(d, d * sum_q);
+            q8[blk].ds = dsh;
+            if (q8_p_ds != nullptr) {
+                q8_p_ds[blk] = dsh;
+            }
         }
     }
 }
@@ -1209,19 +1232,23 @@ void ggml_cuda_op_rms_norm_mul_silu_fused(
     const int num_heads = (int) rms_node->ne[1];
     GGML_ASSERT(rms_node->ne[0] == 128 && rms_node->ne[2] == 1 && rms_node->ne[3] == 1);
 
-    block_q8_1 * dst_q8 = nullptr;
+    block_q8_1 * dst_q8   = nullptr;
+    char *       dst_q8_p = nullptr;
     const int64_t ne10 = (int64_t) num_heads * 128;
     if (ne10 == 4096 && ctx.curr_stream_no == 0 && ctx.q8_1_cache_buf != nullptr) {
         constexpr int64_t ne10_padded = GGML_PAD(4096, MATRIX_ROW_PADDING);
         constexpr size_t  q8_1_bytes  = (size_t) ne10_padded * sizeof(block_q8_1) / QK8_1;
         constexpr size_t  aligned_b   = (q8_1_bytes + 255) & ~size_t(255);
-        if (ctx.q8_1_cache_used + aligned_b <= ctx.q8_1_cache_cap) {
+        constexpr size_t  planar_b    = 4096 + (4096 / 32) * sizeof(half2);
+        constexpr size_t  aligned_p   = (planar_b + 255) & ~size_t(255);
+        if (ctx.q8_1_cache_used + aligned_b + aligned_p <= ctx.q8_1_cache_cap) {
             ctx.q8_1_cache_invalidate_range(out_mul_node->data, ggml_nbytes(out_mul_node));
             char * ptr = (char *) ctx.q8_1_cache_buf + ctx.q8_1_cache_used;
-            ctx.q8_1_cache_used += aligned_b;
+            dst_q8_p   = ptr + aligned_b;
+            ctx.q8_1_cache_used += aligned_b + aligned_p;
             ctx.q8_1_cache.push_back({
                 out_mul_node->data, ggml_nbytes(out_mul_node), GGML_TYPE_F32,
-                4096, 1, 1, 1, 4096, 4096, 4096, ptr
+                4096, 1, 1, 1, 4096, 4096, 4096, ptr, dst_q8_p
             });
             dst_q8 = (block_q8_1 *) ptr;
         }
@@ -1233,6 +1260,8 @@ void ggml_cuda_op_rms_norm_mul_silu_fused(
         (const float *) z->data,
         (float *) out_mul_node->data,
         dst_q8,
+        (int8_t *) dst_q8_p,
+        dst_q8_p ? (half2 *) (dst_q8_p + 4096) : nullptr,
         eps);
 #else
     GGML_UNUSED_VARS(ctx, rms_node, norm_mul_node, silu_node, out_mul_node);

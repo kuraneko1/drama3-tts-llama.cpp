@@ -33,6 +33,13 @@ ggml_tensor * mtmd_graph_drama3_gen::tower_layer(ggml_tensor * x, int il, ggml_t
     const int64_t n_kv      = d_head * n_head_kv;
     const float   eps       = hparams.eps;
 
+    if (n_rows == 1) {
+        ggml_build_forward_expand(gf, x);
+        if (extra) {
+            ggml_build_forward_expand(gf, extra);
+        }
+    }
+
     ggml_tensor * e = ggml_mul(ctx0, ggml_get_rows(ctx0, tl.embd_w, code), mask);
     if (extra) {
         e = ggml_add(ctx0, e, extra);
@@ -159,6 +166,9 @@ ggml_cgraph * mtmd_graph_drama3_gen::build_tower() {
     }
 
     ggml_tensor * mask     = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, inp_scale, n_rows, 0), 1, n_rows);
+    if (n_rows == 1) {
+        ggml_build_forward_expand(gf, mask);
+    }
     ggml_tensor * extra_on = ggml_reshape_2d(ctx0, ggml_view_1d(ctx0, inp_scale, n_rows, (size_t) n_rows * sizeof(float)), 1, n_rows);
 
     ggml_tensor * cb_all = ggml_reshape_2d(ctx0, model.gen_code_embd_w, n_embd_cb, model.gen_code_embd_w->ne[1] * n_cb);

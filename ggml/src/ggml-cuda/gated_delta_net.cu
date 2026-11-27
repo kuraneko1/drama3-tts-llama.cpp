@@ -279,6 +279,78 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+template <bool keep_rs_t>
+__launch_bounds__(256, 2)
+static __global__ void gated_delta_net_f4_t1_cuda(
+        const float * __restrict__ q,
+        const float * __restrict__ k,
+        const float * __restrict__ v,
+        const float * __restrict__ g,
+        const float * __restrict__ beta,
+        const float * __restrict__ curr_state,
+        float * __restrict__       dst,
+        float * __restrict__       state,
+        int64_t                    H,
+        int64_t                    sq1,
+        int64_t                    sq3,
+        int64_t                    sv1,
+        int64_t                    sv3,
+        int64_t                    sb1,
+        int64_t                    sb3,
+        const uint3                neqk1_magic,
+        const uint3                rq3_magic,
+        float                      scale,
+        const int32_t * __restrict__ state_ids,
+        int64_t                    state_in_row_stride) {
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t col      = blockIdx.y * 8 + threadIdx.y; // 0..127
+    const uint32_t sequence = blockIdx.z;
+    const int      lane     = threadIdx.x; // 0..31 -> 32 float4s = 128 rows
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    const int64_t seq_in           = (state_ids != nullptr) ? (int64_t) state_ids[sequence] : (int64_t) sequence;
+    const int64_t state_seq_stride = (state_ids != nullptr) ? state_in_row_stride : H * 128 * 128;
+
+    const float4 * __restrict__ cs4 = reinterpret_cast<const float4 *>(
+        curr_state + seq_in * state_seq_stride + ((int64_t) h_idx * 128 + col) * 128);
+    float4 * __restrict__ st4 = reinterpret_cast<float4 *>(
+        state + (((int64_t) sequence * H + h_idx) * 128 + col) * 128);
+
+    const float4 * __restrict__ k4_ptr = reinterpret_cast<const float4 *>(q ? (k + iq3 * sq3 + iq1 * sq1) : nullptr);
+    const float4 * __restrict__ q4_ptr = reinterpret_cast<const float4 *>(q + iq3 * sq3 + iq1 * sq1);
+
+    float4 s = cs4[lane];
+    const float4 k4 = k4_ptr[lane];
+    const float4 q4 = q4_ptr[lane];
+
+    const int64_t gb_off = sequence * sb3 + h_idx * sb1;
+    const float   g_val  = expf(g[gb_off]);
+    const float   b_val  = beta[gb_off];
+    const float   v_col  = v[sequence * sv3 + h_idx * sv1 + col];
+
+    float kv_part = g_val * (s.x * k4.x + s.y * k4.y + s.z * k4.z + s.w * k4.w);
+    const float kv_col = warp_reduce_sum<32>(kv_part);
+
+    const float delta_col = (v_col - kv_col) * b_val;
+
+    s.x = g_val * s.x + k4.x * delta_col;
+    s.y = g_val * s.y + k4.y * delta_col;
+    s.z = g_val * s.z + k4.z * delta_col;
+    s.w = g_val * s.w + k4.w * delta_col;
+
+    st4[lane] = s;
+
+    float attn_part = s.x * q4.x + s.y * q4.y + s.z * q4.z + s.w * q4.w;
+    const float attn_col = warp_reduce_sum<32>(attn_part);
+
+    if (lane == 0) {
+        dst[((int64_t) sequence * H + h_idx) * 128 + col] = attn_col * scale;
+    }
+    (void) sizeof(keep_rs_t);
+}
+
 template <bool KDA, bool keep_rs_t, bool replay = false>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -303,6 +375,25 @@ static void launch_gated_delta_net(
     // one CTA covers cols_per_warp*num_warps columns (see the kernel)
     dim3      grid_dims(H, n_seqs, (S_v + cols_per_warp * num_warps - 1) / (cols_per_warp * num_warps));
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
+
+    if constexpr (!KDA && !replay) {
+        if (warp_size == 32 && S_v == 128 && n_tokens == 1 &&
+                (!keep_rs_t || K >= 1) &&
+                (sq1 % 4 == 0) && (sq3 % 4 == 0) &&
+                (rep.state_ids == nullptr || (rep.state_in_row_stride % 4 == 0)) &&
+                (((uintptr_t) q_d & 15) == 0) && (((uintptr_t) k_d & 15) == 0) &&
+                (((uintptr_t) s_d & 15) == 0) && (((uintptr_t) state_d & 15) == 0)) {
+            const uint3 neqk1_m = init_fastdiv_values(neqk1);
+            const uint3 rq3_m   = init_fastdiv_values(rq3);
+            const dim3 f4_grid((uint32_t) H, 16, (uint32_t) n_seqs);
+            const dim3 f4_blk(32, 8, 1);
+            gated_delta_net_f4_t1_cuda<keep_rs_t><<<f4_grid, f4_blk, 0, stream>>>(
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                H, sq1, sq3, sv1, sv3, sb1, sb3, neqk1_m, rq3_m, scale,
+                rep.state_ids, rep.state_in_row_stride);
+            return;
+        }
+    }
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);

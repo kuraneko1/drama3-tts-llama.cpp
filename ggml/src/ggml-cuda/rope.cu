@@ -1023,3 +1023,200 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         GGML_ABORT("fatal error");
     }
 }
+
+static __global__ void k_qkv_prep_d256_f32_f16(
+        const float * __restrict__   q_in,
+        const float * __restrict__   q_norm_w,
+        float * __restrict__         q_out,
+        const float * __restrict__   k_in,
+        const float * __restrict__   k_norm_w,
+        half * __restrict__          k_cache,
+        const float * __restrict__   v_in,
+        half * __restrict__          v_cache,
+        const int64_t                q_in_s1,
+        const int64_t                q_out_s1,
+        const int64_t                k_in_s1,
+        const int64_t                k_cache_s1,
+        const int64_t                v_cache_s1,
+        const int                    n_head_q,
+        const int                    n_head_kv,
+        const float                  eps_q,
+        const float                  eps_k,
+        const int                    n_dims,
+        const int32_t * __restrict__ pos,
+        const float                  freq_scale,
+        const float                  ext_factor,
+        const float                  attn_factor,
+        const rope_corr_dims         corr_dims,
+        const float                  theta_scale,
+        const mrope_sections         sections,
+        const bool                   is_neox,
+        const bool                   is_mrope,
+        const bool                   is_imrope,
+        const void * __restrict__    k_row_indices,
+        const void * __restrict__    v_row_indices,
+        const bool                   row_idx_is_i32) {
+    const int bid = blockIdx.x;
+    const int tid = threadIdx.x; // 0..127 (each thread processes 2 of D=256)
+
+    if (bid >= n_head_q + n_head_kv) {
+        const int vh = bid - n_head_q - n_head_kv;
+        const int64_t row_v = row_idx_is_i32
+            ? (int64_t) ((const int32_t *) v_row_indices)[0]
+            :           ((const int64_t *) v_row_indices)[0];
+        const float2 v2 = reinterpret_cast<const float2 *>(v_in + vh * 256)[tid];
+        reinterpret_cast<half2 *>(v_cache + row_v * v_cache_s1 + vh * 256)[tid] = __float22half2_rn(v2);
+        return;
+    }
+
+    const bool is_q = (bid < n_head_q);
+    const int  h    = is_q ? bid : (bid - n_head_q);
+    const float * __restrict__ xc   = is_q ? (q_in + (int64_t) h * q_in_s1) : (k_in + (int64_t) h * k_in_s1);
+    const float * __restrict__ norm = is_q ? q_norm_w : k_norm_w;
+    const float                eps  = is_q ? eps_q : eps_k;
+
+    const float2 x_pair = reinterpret_cast<const float2 *>(xc)[tid];
+    float sq = x_pair.x * x_pair.x + x_pair.y * x_pair.y;
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        sq += __shfl_xor_sync(0xffffffff, sq, m);
+    }
+    __shared__ float s_w[4];
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (lane == 0) {
+        s_w[warp] = sq;
+    }
+    __syncthreads();
+
+    float sum_sq = 0.0f;
+    if (warp == 0 && lane < 4) {
+        sum_sq = s_w[lane];
+    }
+    sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, 2);
+    sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, 1);
+    if (tid == 0) {
+        s_w[0] = rsqrtf(sum_sq / 256.0f + eps);
+    }
+    __syncthreads();
+    const float scale = s_w[0];
+
+    const int i0 = 2 * tid;
+    int ix0, ix1;
+    if ((is_neox || is_mrope) && i0 < n_dims) {
+        ix0 = i0 / 2;
+        ix1 = i0 / 2 + n_dims / 2;
+    } else {
+        ix0 = i0 + 0;
+        ix1 = i0 + 1;
+    }
+
+    const float x0 = scale * xc[ix0] * norm[ix0];
+    const float x1 = scale * xc[ix1] * norm[ix1];
+
+    float o0 = x0;
+    float o1 = x1;
+    if (i0 < n_dims) {
+        const int pos_idx = is_mrope ? rope_mrope_pos_idx(i0, 0, 1, sections, is_imrope) : 0;
+        const float theta_base = pos[pos_idx] * powf(theta_scale, i0 / 2.0f);
+        float cos_theta, sin_theta;
+        rope_yarn<true>(theta_base, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
+        o0 = x0 * cos_theta - x1 * sin_theta;
+        o1 = x0 * sin_theta + x1 * cos_theta;
+    }
+
+    if (is_q) {
+        float * __restrict__ dst_q = q_out + (int64_t) h * q_out_s1;
+        dst_q[ix0] = o0;
+        dst_q[ix1] = o1;
+    } else {
+        const int64_t row_k = row_idx_is_i32
+            ? (int64_t) ((const int32_t *) k_row_indices)[0]
+            :           ((const int64_t *) k_row_indices)[0];
+        half * __restrict__ dst_k = k_cache + row_k * k_cache_s1 + h * 256;
+        dst_k[ix0] = __float2half(o0);
+        dst_k[ix1] = __float2half(o1);
+    }
+}
+
+void ggml_cuda_op_qkv_prep_d256_fused(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * q_rms_norm, ggml_tensor * q_mul, ggml_tensor * q_rope,
+        ggml_tensor * k_rms_norm, ggml_tensor * k_mul, ggml_tensor * k_rope, ggml_tensor * k_set_rows,
+        ggml_tensor * v_set_rows) {
+    const ggml_tensor * x_q = q_rms_norm->src[0];
+    const ggml_tensor * w_q = (q_mul->src[0] == q_rms_norm) ? q_mul->src[1] : q_mul->src[0];
+    const ggml_tensor * x_k = k_rms_norm->src[0];
+    const ggml_tensor * w_k = (k_mul->src[0] == k_rms_norm) ? k_mul->src[1] : k_mul->src[0];
+    const ggml_tensor * x_v = v_set_rows->src[0];
+
+    float eps_q = 0.0f, eps_k = 0.0f;
+    memcpy(&eps_q, q_rms_norm->op_params, sizeof(float));
+    memcpy(&eps_k, k_rms_norm->op_params, sizeof(float));
+
+    const int n_dims     = ((const int32_t *) q_rope->op_params)[1];
+    const int mode       = ((const int32_t *) q_rope->op_params)[2];
+    const int n_ctx_orig = ((const int32_t *) q_rope->op_params)[4];
+
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    mrope_sections sections;
+    memcpy(&freq_base,   (const int32_t *) q_rope->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) q_rope->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) q_rope->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) q_rope->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) q_rope->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) q_rope->op_params + 10, sizeof(float));
+    memcpy(&sections.v,  (const int32_t *) q_rope->op_params + 11, sizeof(int) * 4);
+
+    const bool is_neox   = (mode & GGML_ROPE_TYPE_NEOX) != 0;
+    const bool is_mrope  = (mode & GGML_ROPE_TYPE_MROPE) != 0;
+    const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
+    const float theta_scale = powf(freq_base, -2.0f / n_dims);
+
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(q_rope), corr_dims.v);
+
+    const int n_head_q  = (int) x_q->ne[1];
+    const int n_head_kv = (int) x_k->ne[1];
+    const int64_t q_in_s1    = x_q->nb[1] / sizeof(float);
+    const int64_t q_out_s1   = q_rope->nb[1] / sizeof(float);
+    const int64_t k_in_s1    = x_k->nb[1] / sizeof(float);
+    const int64_t k_cache_s1 = k_set_rows->nb[1] / sizeof(half);
+    const int64_t v_cache_s1 = v_set_rows->nb[1] / sizeof(half);
+    const bool row_idx_is_i32 = (k_set_rows->src[1]->type == GGML_TYPE_I32);
+
+    const int total_blocks = n_head_q + 2 * n_head_kv;
+    k_qkv_prep_d256_f32_f16<<<total_blocks, 128, 0, ctx.stream()>>>(
+        (const float *) x_q->data,
+        (const float *) w_q->data,
+        (float *) q_rope->data,
+        (const float *) x_k->data,
+        (const float *) w_k->data,
+        (half *) k_set_rows->data,
+        (const float *) x_v->data,
+        (half *) v_set_rows->data,
+        q_in_s1,
+        q_out_s1,
+        k_in_s1,
+        k_cache_s1,
+        v_cache_s1,
+        n_head_q,
+        n_head_kv,
+        eps_q,
+        eps_k,
+        n_dims,
+        (const int32_t *) q_rope->src[1]->data,
+        freq_scale,
+        ext_factor,
+        attn_factor,
+        corr_dims,
+        theta_scale,
+        sections,
+        is_neox,
+        is_mrope,
+        is_imrope,
+        k_set_rows->src[1]->data,
+        v_set_rows->src[1]->data,
+        row_idx_is_i32);
+    (void) k_rope;
+}

@@ -462,7 +462,13 @@ static __global__ void topk_moe_256_row1_cuda(
             }
         }
         if ((best_idx & 31) == lane) {
-            r[best_idx >> 5] = -INFINITY;
+            const int slot = best_idx >> 5;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i == slot) {
+                    r[i] = -INFINITY;
+                }
+            }
         }
         if (k == lane) {
             out_w = best_val;
